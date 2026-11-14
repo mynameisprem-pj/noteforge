@@ -13,6 +13,8 @@ import {
 import {
   GUEST_WORKSPACE_ID,
   setActiveWorkspace,
+  setCloudSyncAllowed,
+  syncCloudWorkspace,
   syncGuestToAuthenticatedWorkspace,
   ensureStarterNotes,
   getAllNotes,
@@ -679,9 +681,14 @@ async function runAIAction(statusMessage, fn) {
 }
 
 function bindEvents() {
-  window.addEventListener('online', () => {
+  window.addEventListener('online', async () => {
     state.online = true;
     renderTopStatus();
+    if (state.user && !state.user.isAnonymous && state.privacyMode !== USER_PRIVACY_MODES.STRICT_LOCAL) {
+      await syncCloudWorkspace(state.user.uid);
+      await refreshNotes(state.activeNoteId);
+      populateEditorFromActiveNote();
+    }
   });
   window.addEventListener('offline', () => {
     state.online = false;
@@ -709,6 +716,8 @@ function bindEvents() {
 
   document.querySelector('#mode-prefer-local').addEventListener('click', async () => {
     state.privacyMode = USER_PRIVACY_MODES.HYBRID_DEFAULT;
+    setCloudSyncAllowed(true);
+    if (state.user && !state.user.isAnonymous) { syncCloudWorkspace(state.user.uid); }
     await setSetting('privacyMode', state.privacyMode);
     state.aiErrorMsg = '';
     renderTopStatus();
@@ -718,6 +727,7 @@ function bindEvents() {
 
   document.querySelector('#mode-only-local').addEventListener('click', async () => {
     state.privacyMode = USER_PRIVACY_MODES.STRICT_LOCAL;
+    setCloudSyncAllowed(false);
     await setSetting('privacyMode', state.privacyMode);
     state.aiErrorMsg = '';
     renderTopStatus();
@@ -760,7 +770,7 @@ function bindEvents() {
     saveDebounceTimer = setTimeout(async () => {
       await saveNote({ ...note, title, content });
       await refreshNotes(note.id);
-      saveEl.textContent = 'Saved offline';
+      saveEl.textContent = state.user && !state.user.isAnonymous && state.privacyMode !== USER_PRIVACY_MODES.STRICT_LOCAL && state.online ? 'Saved · Cloud synced' : 'Saved offline';
     }, 280);
   };
 
@@ -915,6 +925,7 @@ async function init() {
   bindEvents();
 
   state.privacyMode = await getSetting('privacyMode', USER_PRIVACY_MODES.HYBRID_DEFAULT);
+  setCloudSyncAllowed(state.privacyMode !== USER_PRIVACY_MODES.STRICT_LOCAL);
   state.notes = await ensureStarterNotes();
   state.activeNoteId = state.notes[0]?.id || null;
   state.aiRuns = await getRecentAIRuns(25);

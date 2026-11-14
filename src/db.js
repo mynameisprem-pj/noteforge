@@ -1,11 +1,20 @@
 import { openDB } from 'idb';
+import {
+  firestoreDb,
+  collection,
+  doc,
+  getDocs,
+  setDoc,
+  deleteDoc
+} from './firebase.js';
 
 const DB_NAME = 'noteforge-vault-db';
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 
 export const GUEST_WORKSPACE_ID = 'guest';
 
 let activeWorkspaceId = GUEST_WORKSPACE_ID;
+let cloudSyncAllowed = true; // Paused automatically when ONLY_ON_DEVICE privacy lock is active
 
 export function setActiveWorkspace(workspaceId) {
   activeWorkspaceId = workspaceId || GUEST_WORKSPACE_ID;
@@ -13,6 +22,20 @@ export function setActiveWorkspace(workspaceId) {
 
 export function getActiveWorkspace() {
   return activeWorkspaceId;
+}
+
+export function setCloudSyncAllowed(allowed) {
+  cloudSyncAllowed = Boolean(allowed);
+}
+
+function canSyncWithCloud(ownerId = activeWorkspaceId) {
+  return (
+    Boolean(ownerId) &&
+    ownerId !== GUEST_WORKSPACE_ID &&
+    cloudSyncAllowed &&
+    typeof navigator !== 'undefined' &&
+    navigator.onLine
+  );
 }
 
 function countWords(text = '') {
@@ -62,10 +85,97 @@ export const dbPromise = openDB(DB_NAME, DB_VERSION, {
     if (!db.objectStoreNames.contains('settings')) {
       db.createObjectStore('settings', { keyPath: 'key' });
     }
+
+    if (!db.objectStoreNames.contains('pending_deletes')) {
+      const delStore = db.createObjectStore('pending_deletes', { keyPath: 'id' });
+      delStore.createIndex('by-owner', 'ownerId');
+    }
   }
 });
 
-// ---------------- NOTES CRUD (SCOPED BY WORKSPACE) ----------------
+// ---------------- CLOUD FIRESTORE HELPERS ----------------
+
+async function pushNoteToCloud(note) {
+  if (!canSyncWithCloud(note.ownerId)) return false;
+  try {
+    const noteRef = doc(firestoreDb, 'users', note.ownerId, 'notes', note.id);
+    const { needsCloudSync, ...cleanPayload } = note;
+    await setDoc(noteRef, cleanPayload);
+
+    const db = await dbPromise;
+    const latestLocal = await db.get('notes', note.id);
+    if (latestLocal && latestLocal.updatedAt === note.updatedAt && latestLocal.needsCloudSync) {
+      await db.put('notes', { ...latestLocal, needsCloudSync: false });
+    }
+    return true;
+  } catch (err) {
+    console.warn('[Cloud Sync] Deferred note upload to offline queue:', err?.message);
+    return false;
+  }
+}
+
+/**
+ * Bidirectional Last-Write-Wins merge between local IndexedDB and Cloud Firestore
+ * for signed-in Google accounts.
+ */
+export async function syncCloudWorkspace(ownerId = activeWorkspaceId) {
+  if (!canSyncWithCloud(ownerId)) return { synced: false };
+
+  try {
+    const db = await dbPromise;
+
+    // 1. Flush any offline deletions first
+    const pendingDeletes = await db.getAllFromIndex('pending_deletes', 'by-owner', ownerId);
+    for (const item of pendingDeletes) {
+      await deleteDoc(doc(firestoreDb, 'users', ownerId, 'notes', item.noteId));
+      await db.delete('pending_deletes', item.id);
+    }
+
+    // 2. Fetch remote notes from Firestore
+    const notesCol = collection(firestoreDb, 'users', ownerId, 'notes');
+    const snap = await getDocs(notesCol);
+    const remoteMap = new Map();
+    snap.forEach((docSnap) => {
+      remoteMap.set(docSnap.id, docSnap.data());
+    });
+
+    // 3. Compare with local IndexedDB notes
+    const localNotes = await db.getAllFromIndex('notes', 'by-owner', ownerId);
+    const localMap = new Map(localNotes.map((n) => [n.id, n]));
+
+    // Pull newer or missing remote notes into IndexedDB
+    for (const [id, remoteNote] of remoteMap.entries()) {
+      const localNote = localMap.get(id);
+      if (!localNote || (remoteNote.updatedAt || 0) > (localNote.updatedAt || 0)) {
+        await db.put('notes', {
+          ...remoteNote,
+          id,
+          ownerId,
+          needsCloudSync: false
+        });
+      }
+    }
+
+    // Push newer or unsynced local notes up to Firestore
+    for (const [id, localNote] of localMap.entries()) {
+      const remoteNote = remoteMap.get(id);
+      if (
+        !remoteNote ||
+        localNote.needsCloudSync ||
+        (localNote.updatedAt || 0) > (remoteNote.updatedAt || 0)
+      ) {
+        await pushNoteToCloud(localNote);
+      }
+    }
+
+    return { synced: true };
+  } catch (err) {
+    console.warn('[Cloud Sync] Could not complete cloud sync:', err?.message);
+    return { synced: false, error: err?.message };
+  }
+}
+
+// ---------------- NOTES CRUD (INDEXEDDB FIRST + BACKGROUND SYNC) ----------------
 
 export async function getAllNotes(ownerId = activeWorkspaceId) {
   const db = await dbPromise;
@@ -83,6 +193,7 @@ export async function saveNote(partial, ownerId = activeWorkspaceId) {
   const now = Date.now();
   const existing = partial.id ? await db.get('notes', partial.id) : null;
 
+  const targetOwner = partial.ownerId || existing?.ownerId || ownerId;
   const content = partial.content ?? existing?.content ?? '';
   const title = (partial.title ?? existing?.title ?? 'Untitled Note').trim() || 'Untitled Note';
   const rawTags = partial.tags ?? existing?.tags ?? [];
@@ -90,7 +201,7 @@ export async function saveNote(partial, ownerId = activeWorkspaceId) {
 
   const record = {
     id: existing?.id || partial.id || crypto.randomUUID(),
-    ownerId: partial.ownerId || existing?.ownerId || ownerId,
+    ownerId: targetOwner,
     isStarter: partial.isStarter ?? existing?.isStarter ?? false,
     title,
     content,
@@ -99,15 +210,24 @@ export async function saveNote(partial, ownerId = activeWorkspaceId) {
     wordCount: countWords(content),
     charCount: content.length,
     createdAt: existing?.createdAt || now,
-    updatedAt: now
+    updatedAt: now,
+    needsCloudSync: targetOwner !== GUEST_WORKSPACE_ID
   };
 
   await db.put('notes', record);
+
+  if (canSyncWithCloud(targetOwner)) {
+    pushNoteToCloud(record);
+  }
+
   return record;
 }
 
 export async function deleteNote(id) {
   const db = await dbPromise;
+  const existing = await db.get('notes', id);
+  const ownerId = existing?.ownerId || activeWorkspaceId;
+
   const tx = db.transaction(['notes', 'ai_runs'], 'readwrite');
   await tx.objectStore('notes').delete(id);
 
@@ -118,14 +238,29 @@ export async function deleteNote(id) {
     cursor = await cursor.continue();
   }
   await tx.done;
+
+  if (ownerId !== GUEST_WORKSPACE_ID) {
+    if (canSyncWithCloud(ownerId)) {
+      try {
+        await deleteDoc(doc(firestoreDb, 'users', ownerId, 'notes', id));
+      } catch {
+        await db.put('pending_deletes', { id: `${ownerId}_${id}`, ownerId, noteId: id });
+      }
+    } else {
+      await db.put('pending_deletes', { id: `${ownerId}_${id}`, ownerId, noteId: id });
+    }
+  }
 }
 
 /**
- * Carries over Guest notes & AI runs when a user signs into Google so they never see
- * an unexpected blank screen—and resets Guest workspace cleanly so Google data never leaks on Sign Out.
+ * Pulls existing Cloud notes for this Google UID first; if brand-new account, migrates Guest notes;
+ * if returning account, merges only non-starter Guest drafts and syncs everything to Cloud.
  */
 export async function syncGuestToAuthenticatedWorkspace(googleUid) {
   if (!googleUid || googleUid === GUEST_WORKSPACE_ID) return;
+
+  // 1. Pull any existing notes from Cloud Firestore first (critical when signing in on a 2nd browser!)
+  await syncCloudWorkspace(googleUid);
 
   const db = await dbPromise;
   const guestNotes = await db.getAllFromIndex('notes', 'by-owner', GUEST_WORKSPACE_ID);
@@ -136,26 +271,27 @@ export async function syncGuestToAuthenticatedWorkspace(googleUid) {
   const runsStore = tx.objectStore('ai_runs');
 
   if (userNotes.length === 0 && guestNotes.length > 0) {
-    // First-time Google sign-in on this device: move all current Guest notes into their Google workspace
     for (const note of guestNotes) {
-      await notesStore.put({ ...note, ownerId: googleUid });
+      await notesStore.put({ ...note, ownerId: googleUid, needsCloudSync: true });
     }
     const guestRuns = await runsStore.index('by-owner').getAll(GUEST_WORKSPACE_ID);
     for (const run of guestRuns) {
       await runsStore.put({ ...run, ownerId: googleUid });
     }
   } else {
-    // Returning Google user: move only non-starter custom drafts created in Guest mode
     const customGuestDrafts = guestNotes.filter((n) => !n.isStarter);
     for (const draft of customGuestDrafts) {
-      await notesStore.put({ ...draft, ownerId: googleUid });
+      await notesStore.put({ ...draft, ownerId: googleUid, needsCloudSync: true });
     }
   }
 
   await tx.done;
+
+  // 2. Push any newly migrated notes up to Firestore
+  await syncCloudWorkspace(googleUid);
 }
 
-// ---------------- AI PROVENANCE HISTORY (SCOPED BY WORKSPACE) ----------------
+// ---------------- AI PROVENANCE HISTORY ----------------
 
 export async function saveAIRun(entry) {
   const db = await dbPromise;
@@ -253,9 +389,11 @@ Key observations from shadowing morning patient intake:
 
 export async function ensureStarterNotes(ownerId = activeWorkspaceId) {
   const existing = await getAllNotes(ownerId);
-  if (existing.length > 0) return existing;
+  if (existing.length > 0) {
+    await setSetting(`seeded_${ownerId}`, true);
+    return existing;
+  }
 
-  // Only seed starter templates once per workspace so if a user intentionally deletes all notes, they stay deleted
   const seededFlagKey = `seeded_${ownerId}`;
   const alreadySeeded = await getSetting(seededFlagKey, false);
   if (alreadySeeded && ownerId !== GUEST_WORKSPACE_ID) {

@@ -1,4 +1,5 @@
 import { initializeApp } from 'firebase/app';
+import { getFirestore, collection, doc, getDocs, setDoc, deleteDoc } from 'firebase/firestore/lite';
 import {
   initializeAuth,
   indexedDBLocalPersistence,
@@ -195,3 +196,6 @@ export async function warmUpOnDeviceModel(onProgress) {
   session.destroy();
   return checkOnDeviceModelStatus();
 }
+
+export const firestoreDb = getFirestore(firebaseApp);
+export { collection, doc, getDocs, setDoc, deleteDoc };
