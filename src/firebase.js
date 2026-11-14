@@ -14,7 +14,7 @@ import {
 } from 'firebase/auth';
 import {
   initializeAppCheck,
-  ReCaptchaV3Provider,
+  ReCaptchaEnterpriseProvider,
   getToken as getAppCheckToken
 } from 'firebase/app-check';
 import {
@@ -61,7 +61,7 @@ if (typeof window !== 'undefined') {
   const siteKey = import.meta.env.VITE_RECAPTCHA_V3_SITE_KEY?.trim();
   if (siteKey && !siteKey.includes('your_')) {
     appCheckInstance = initializeAppCheck(firebaseApp, {
-      provider: new ReCaptchaV3Provider(siteKey),
+      provider: new ReCaptchaEnterpriseProvider(siteKey),
       isTokenAutoRefreshEnabled: navigator.onLine
     });
   }
