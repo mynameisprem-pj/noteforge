@@ -32,6 +32,27 @@ import {
 
 marked.setOptions({ breaks: true, gfm: true });
 
+const ICONS = {
+  append: `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M5 12h14"/></svg>`,
+  saveNote: `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg>`,
+  check: `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>`
+};
+
+function flashButtonDone(btn, doneLabel) {
+  if (!btn || btn.dataset.flashing === '1') return;
+  const originalHtml = btn.innerHTML;
+  btn.dataset.flashing = '1';
+  btn.classList.add('btn-done');
+  btn.innerHTML = `${ICONS.check}<span>${doneLabel}</span>`;
+
+  setTimeout(() => {
+    if (!btn.isConnected) return;
+    btn.classList.remove('btn-done');
+    btn.innerHTML = originalHtml;
+    delete btn.dataset.flashing;
+  }, 1800);
+}
+
 function renderSafeMarkdown(mdText = '') {
   return DOMPurify.sanitize(marked.parse(mdText));
 }
@@ -67,8 +88,8 @@ const state = {
   nanoDownloadPct: null,
   appCheckOk: false,
   user: null,
-  mobileTab: 'editor',
-  openPopover: null // 'telemetry' | 'account' | null
+  mobileTab: 'editor', // 'notes' | 'editor' | 'ai'
+  openPopover: null
 };
 
 let saveDebounceTimer = null;
@@ -112,7 +133,6 @@ function mountShell() {
       </div>
 
       <div class="topbar-right">
-        <!-- Compact 2-State Mode Toggle -->
         <div class="mode-switch" role="group" aria-label="AI Inference Mode">
           <button id="mode-prefer-local" class="mode-btn" title="PREFER_ON_DEVICE: Try Gemini Nano locally first, fall back to Cloud">
             Hybrid
@@ -123,7 +143,6 @@ function mountShell() {
           </button>
         </div>
 
-        <!-- Clean System & Hybrid Telemetry Popover -->
         <div class="popover-wrap">
           <button id="btn-telemetry" class="icon-pill-btn" aria-label="System & AI Status">
             <span id="top-status-dot" class="status-dot"></span>
@@ -132,7 +151,6 @@ function mountShell() {
           <div id="popover-telemetry" class="popover-card"></div>
         </div>
 
-        <!-- Clean User Account Avatar Popover -->
         <div class="popover-wrap">
           <button id="btn-account" class="avatar-btn" aria-label="Account Menu" title="Account & Sign-In"></button>
           <div id="popover-account" class="popover-card" style="width:245px;"></div>
@@ -141,11 +159,11 @@ function mountShell() {
     </header>
 
     <main class="workspace">
-      <!-- PANE 1: NOTES VAULT -->
-      <aside id="pane-vault" class="pane">
+      <!-- PANE 1: NOTES LIBRARY -->
+      <aside id="pane-notes" class="pane">
         <div class="pane-header">
           <div class="pane-title-row">
-            <span class="pane-title">Vault (<span id="notes-count">0</span>)</span>
+            <span class="pane-title">Notes (<span id="notes-count">0</span>)</span>
             <button id="btn-new-note" class="btn btn-primary" style="padding:0.3rem 0.62rem; font-size:0.75rem;">+ New</button>
           </div>
           <input id="input-search" class="search-input" type="search" placeholder="Search notes or #tags..." />
@@ -235,10 +253,10 @@ function mountShell() {
 
     <!-- ICON + LABEL MOBILE DOCK -->
     <nav class="mobile-tabs" aria-label="Workspace navigation">
-      <button class="mobile-tab-btn" data-tab="vault">
-        <span id="mobile-vault-badge" class="tab-badge">0</span>
+      <button class="mobile-tab-btn" data-tab="notes">
+        <span id="mobile-notes-badge" class="tab-badge">0</span>
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
-        <span>Vault</span>
+        <span>Notes</span>
       </button>
       <button class="mobile-tab-btn active" data-tab="editor">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
@@ -252,8 +270,6 @@ function mountShell() {
     </nav>
   `;
 }
-
-// ---------------- RENDER UPDATES ----------------
 
 function renderTopStatus() {
   const dotEl = document.querySelector('#top-status-dot');
@@ -269,7 +285,6 @@ function renderTopStatus() {
     ? `<strong style="color:var(--emerald-text);">ONLY_ON_DEVICE:</strong> Strict privacy lock. Cloud fallback is refused.`
     : `<strong style="color:var(--sky-text);">PREFER_ON_DEVICE:</strong> Tries local Gemini Nano first; falls back to Cloud seamlessly.`;
 
-  // Telemetry Popover Content
   const isNanoReady = state.nanoState === 'available' || state.nanoState === 'readily';
   const canDownloadNano = state.nanoState === 'downloadable' || state.nanoState === 'after-download';
   const onDeviceCount = state.aiRuns.filter((r) => r.sourceLabel === 'On device').length;
@@ -330,7 +345,6 @@ function renderTopStatus() {
     }
   });
 
-  // Account Avatar & Popover
   const accBtn = document.querySelector('#btn-account');
   const accPop = document.querySelector('#popover-account');
   accPop.classList.toggle('open', state.openPopover === 'account');
@@ -390,10 +404,10 @@ function renderTopStatus() {
   }
 }
 
-function renderVaultList() {
+function renderNotesList() {
   const countStr = String(state.notes.length);
   document.querySelector('#notes-count').textContent = countStr;
-  document.querySelector('#mobile-vault-badge').textContent = countStr;
+  document.querySelector('#mobile-notes-badge').textContent = countStr;
   document.querySelector('#synth-count').textContent = String(state.selectedForSynthesis.size);
 
   const listEl = document.querySelector('#notes-list');
@@ -436,7 +450,7 @@ function renderVaultList() {
     card.addEventListener('click', (e) => {
       if (e.target.closest('.synth-check-label')) return;
       state.activeNoteId = card.dataset.noteId;
-      renderVaultList();
+      renderNotesList();
       populateEditorFromActiveNote();
       if (window.innerWidth <= 880) switchMobileTab('editor');
     });
@@ -575,8 +589,12 @@ function renderAIPane() {
             <span>${run.latencyMs} ms · ${formatTimeAgo(run.createdAt)}</span>
           </div>
           <div class="result-actions">
-            <button class="btn" data-insert-output="${run.id}" style="font-size:0.7rem; padding:0.22rem 0.5rem;">Append to Note</button>
-            <button class="btn" data-save-new-note="${run.id}" style="font-size:0.7rem; padding:0.22rem 0.5rem;">Save as Note</button>
+            <button class="btn" data-insert-output="${run.id}" style="font-size:0.7rem; padding:0.24rem 0.55rem;">
+              ${ICONS.append}<span>Append to Note</span>
+            </button>
+            <button class="btn" data-save-new-note="${run.id}" style="font-size:0.7rem; padding:0.24rem 0.55rem;">
+              ${ICONS.saveNote}<span>Save as Note</span>
+            </button>
           </div>
         </article>
       `;
@@ -592,6 +610,7 @@ function renderAIPane() {
       const updated = await saveNote({ ...note, content: appended });
       await refreshNotes(updated.id);
       populateEditorFromActiveNote();
+      flashButtonDone(btn, 'Appended');
     });
   });
 
@@ -606,13 +625,14 @@ function renderAIPane() {
       });
       await refreshNotes(created.id);
       populateEditorFromActiveNote();
+      flashButtonDone(btn, 'Saved');
     });
   });
 }
 
 function switchMobileTab(tabName) {
   state.mobileTab = tabName;
-  document.querySelector('#pane-vault').classList.toggle('mobile-active', tabName === 'vault');
+  document.querySelector('#pane-notes').classList.toggle('mobile-active', tabName === 'notes');
   document.querySelector('#pane-editor').classList.toggle('mobile-active', tabName === 'editor');
   document.querySelector('#pane-ai').classList.toggle('mobile-active', tabName === 'ai');
 
@@ -632,7 +652,7 @@ async function refreshNotes(preferredActiveId = null) {
   } else if (!state.notes.some((n) => n.id === state.activeNoteId)) {
     state.activeNoteId = state.notes[0]?.id || null;
   }
-  renderVaultList();
+  renderNotesList();
 }
 
 async function runAIAction(statusMessage, fn) {
@@ -665,7 +685,6 @@ function bindEvents() {
     renderTopStatus();
   });
 
-  // Popover toggles & outside-click close
   document.querySelector('#btn-telemetry').addEventListener('click', (e) => {
     e.stopPropagation();
     state.openPopover = state.openPopover === 'telemetry' ? null : 'telemetry';
@@ -719,7 +738,7 @@ function bindEvents() {
 
   document.querySelector('#input-search').addEventListener('input', (e) => {
     state.searchQuery = e.target.value;
-    renderVaultList();
+    renderNotesList();
   });
 
   const scheduleAutoSave = () => {
@@ -847,19 +866,19 @@ function bindEvents() {
 
   document.querySelector('#btn-select-all-synth').addEventListener('click', () => {
     state.notes.forEach((n) => state.selectedForSynthesis.add(n.id));
-    renderVaultList();
+    renderNotesList();
   });
 
   document.querySelector('#btn-clear-synth').addEventListener('click', () => {
     state.selectedForSynthesis.clear();
-    renderVaultList();
+    renderNotesList();
   });
 
   document.querySelector('#form-synthesis').addEventListener('submit', (e) => {
     e.preventDefault();
     const selectedNotes = state.notes.filter((n) => state.selectedForSynthesis.has(n.id));
     if (selectedNotes.length < 2) {
-      state.aiErrorMsg = 'Select at least 2 notes in the Vault first.';
+      state.aiErrorMsg = 'Select at least 2 notes in the Notes list first.';
       renderAIPane();
       return;
     }
@@ -898,7 +917,7 @@ async function init() {
   state.aiRuns = await getRecentAIRuns(25);
 
   renderTopStatus();
-  renderVaultList();
+  renderNotesList();
   populateEditorFromActiveNote();
   renderAIPane();
 

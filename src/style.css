@@ -909,3 +909,11 @@ button {
     display: grid;
   }
 }
+
+/* Action Button Micro-Feedback State */
+.btn.btn-done {
+  background: var(--emerald-bg);
+  border-color: var(--emerald-border);
+  color: var(--emerald-text);
+  pointer-events: none;
+}
