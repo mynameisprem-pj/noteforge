@@ -53,7 +53,7 @@ let appCheckInstance = null;
 
 if (typeof window !== 'undefined') {
   const debugToken = import.meta.env.VITE_APPCHECK_DEBUG_TOKEN?.trim();
-  if (import.meta.env.DEV || (debugToken && !debugToken.includes('your_'))) {
+  if (import.meta.env.DEV) {
     self.FIREBASE_APPCHECK_DEBUG_TOKEN =
       debugToken && !debugToken.includes('your_') ? debugToken : true;
   }
