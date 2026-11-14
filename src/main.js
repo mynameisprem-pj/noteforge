@@ -33,8 +33,7 @@ import {
 marked.setOptions({ breaks: true, gfm: true });
 
 function renderSafeMarkdown(mdText = '') {
-  const rawHtml = marked.parse(mdText);
-  return DOMPurify.sanitize(rawHtml);
+  return DOMPurify.sanitize(marked.parse(mdText));
 }
 
 function escapeHtml(str = '') {
@@ -53,7 +52,6 @@ function formatTimeAgo(ts) {
   return new Date(ts).toLocaleDateString();
 }
 
-// ---------------- APPLICATION STATE ----------------
 const state = {
   notes: [],
   activeNoteId: null,
@@ -69,8 +67,8 @@ const state = {
   nanoDownloadPct: null,
   appCheckOk: false,
   user: null,
-  mobileTab: 'editor', // 'vault' | 'editor' | 'ai'
-  saveStateText: 'Saved offline in IndexedDB'
+  mobileTab: 'editor',
+  openPopover: null // 'telemetry' | 'account' | null
 };
 
 let saveDebounceTimer = null;
@@ -90,7 +88,12 @@ function getFilteredNotes() {
   );
 }
 
-// ---------------- SHELL RENDER ----------------
+function autoResizeTitle(el) {
+  if (!el) return;
+  el.style.height = 'auto';
+  el.style.height = `${el.scrollHeight}px`;
+}
+
 const appEl = document.querySelector('#app');
 
 function mountShell() {
@@ -98,34 +101,42 @@ function mountShell() {
     <header class="topbar">
       <div class="brand">
         <div class="brand-logo" aria-hidden="true">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
             <path d="M12 2L2 7l10 5 10-5-10-5z"/>
             <path d="M2 17l10 5 10-5"/>
             <path d="M2 12l10 5 10-5"/>
           </svg>
         </div>
-        <div>
-          <div class="brand-title">NoteForge</div>
-          <div class="brand-sub">Offline-First Hybrid AI Research Companion</div>
-        </div>
+        <span class="brand-title">NoteForge</span>
+        <span class="brand-tag">Offline-First Hybrid AI</span>
       </div>
 
-      <div class="topbar-controls">
-        <span id="pill-network" class="status-pill"></span>
-        <span id="pill-nano" class="status-pill" title="Chrome Built-in Gemini Nano status"></span>
-        <button id="btn-warmup-nano" class="btn" style="display:none; font-size:0.73rem; padding:0.28rem 0.6rem;">Enable Local Nano</button>
-        <span id="pill-appcheck" class="status-pill" title="Firebase App Check protection"></span>
-
-        <div class="mode-switch" role="group" aria-label="AI Inference Privacy Mode">
-          <button id="mode-prefer-local" class="mode-btn" title="Try Gemini Nano on-device first; fall back to Cloud when needed">
-            Hybrid (Prefer On-Device)
+      <div class="topbar-right">
+        <!-- Compact 2-State Mode Toggle -->
+        <div class="mode-switch" role="group" aria-label="AI Inference Mode">
+          <button id="mode-prefer-local" class="mode-btn" title="PREFER_ON_DEVICE: Try Gemini Nano locally first, fall back to Cloud">
+            Hybrid
           </button>
-          <button id="mode-only-local" class="mode-btn" title="Strict Privacy Lock: ONLY_ON_DEVICE — refuses cloud">
-            Privacy Lock (Only On-Device)
+          <button id="mode-only-local" class="mode-btn" title="ONLY_ON_DEVICE: Strict Privacy Lock — never send notes to Cloud">
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+            Local Only
           </button>
         </div>
 
-        <div id="auth-controls" class="auth-bar"></div>
+        <!-- Clean System & Hybrid Telemetry Popover -->
+        <div class="popover-wrap">
+          <button id="btn-telemetry" class="icon-pill-btn" aria-label="System & AI Status">
+            <span id="top-status-dot" class="status-dot"></span>
+            <span id="top-status-label" class="status-label-text">Ready</span>
+          </button>
+          <div id="popover-telemetry" class="popover-card"></div>
+        </div>
+
+        <!-- Clean User Account Avatar Popover -->
+        <div class="popover-wrap">
+          <button id="btn-account" class="avatar-btn" aria-label="Account Menu" title="Account & Sign-In"></button>
+          <div id="popover-account" class="popover-card" style="width:245px;"></div>
+        </div>
       </div>
     </header>
 
@@ -134,10 +145,10 @@ function mountShell() {
       <aside id="pane-vault" class="pane">
         <div class="pane-header">
           <div class="pane-title-row">
-            <span class="pane-title">IndexedDB Vault (<span id="notes-count">0</span>)</span>
-            <button id="btn-new-note" class="btn btn-primary" style="padding:0.32rem 0.65rem; font-size:0.76rem;">+ New Note</button>
+            <span class="pane-title">Vault (<span id="notes-count">0</span>)</span>
+            <button id="btn-new-note" class="btn btn-primary" style="padding:0.3rem 0.62rem; font-size:0.75rem;">+ New</button>
           </div>
-          <input id="input-search" class="search-input" type="search" placeholder="Search notes or #tags offline..." />
+          <input id="input-search" class="search-input" type="search" placeholder="Search notes or #tags..." />
         </div>
         <div id="notes-list" class="notes-list"></div>
       </aside>
@@ -145,48 +156,47 @@ function mountShell() {
       <!-- PANE 2: NOTE EDITOR -->
       <section id="pane-editor" class="pane editor-pane mobile-active">
         <div class="editor-toolbar">
-          <span id="save-indicator" class="save-indicator">Saved offline in IndexedDB</span>
-          <div style="display:flex; gap:0.45rem; align-items:center;">
-            <button id="btn-pin-note" class="btn" style="font-size:0.75rem; padding:0.32rem 0.62rem;">Pin</button>
-            <button id="btn-export-md" class="btn" style="font-size:0.75rem; padding:0.32rem 0.62rem;">Export .md</button>
-            <button id="btn-delete-note" class="btn btn-danger" style="font-size:0.75rem; padding:0.32rem 0.62rem;">Delete</button>
+          <span id="save-indicator" class="save-indicator">Saved offline</span>
+          <div style="display:flex; gap:0.38rem; align-items:center;">
+            <button id="btn-pin-note" class="btn" style="font-size:0.73rem; padding:0.28rem 0.58rem;">Pin</button>
+            <button id="btn-export-md" class="btn" style="font-size:0.73rem; padding:0.28rem 0.58rem;">.md</button>
+            <button id="btn-delete-note" class="btn btn-ghost-danger" style="font-size:0.73rem; padding:0.28rem 0.58rem;">Delete</button>
           </div>
         </div>
 
         <div class="editor-body">
-          <input id="editor-title" class="title-input" type="text" placeholder="Note title..." />
+          <textarea id="editor-title" class="title-textarea" rows="1" placeholder="Untitled note..."></textarea>
           <div class="tags-editor-row">
             <div id="editor-tags" class="tag-row"></div>
-            <input id="input-add-tag" class="tag-input" type="text" placeholder="+ add tag & press Enter" />
+            <input id="input-add-tag" class="tag-input" type="text" placeholder="+ add tag" />
           </div>
-          <textarea id="editor-content" class="content-textarea" placeholder="Write field notes, paste literature excerpts, or draft confidential findings... Everything saves instantly to IndexedDB and works offline."></textarea>
+          <textarea id="editor-content" class="content-textarea" placeholder="Capture research notes, field interviews, or drafts... Saved automatically to IndexedDB for instant offline access."></textarea>
           <div class="editor-footer">
             <span id="editor-stats">0 words · 0 chars</span>
-            <span id="editor-routing-hint"></span>
+            <span id="editor-routing-hint" class="editor-routing-hint-text"></span>
           </div>
         </div>
       </section>
 
-      <!-- PANE 3: HYBRID AI RESEARCH COMPANION -->
+      <!-- PANE 3: HYBRID AI COMPANION -->
       <aside id="pane-ai" class="pane ai-pane">
         <div class="pane-header">
           <div class="pane-title-row">
             <span class="pane-title">Hybrid AI Companion</span>
-            <button id="btn-clear-runs" class="btn" style="font-size:0.7rem; padding:0.22rem 0.5rem;">Clear History</button>
+            <button id="btn-clear-runs" class="btn" style="font-size:0.69rem; padding:0.2rem 0.48rem;">Clear</button>
           </div>
-          <div id="mode-explainer" style="font-size:0.74rem; color:var(--text-muted); line-height:1.4;"></div>
+          <div id="mode-explainer" style="font-size:0.73rem; color:var(--text-muted); line-height:1.38;"></div>
         </div>
 
         <div class="ai-scroll">
-          <!-- Quick Single-Note Capabilities -->
           <div class="action-card">
             <div class="action-card-label">
-              <span>Active Note Actions</span>
+              <span>Note Actions</span>
               <span style="font-weight:500; text-transform:none;">On-device first</span>
             </div>
             <div class="action-grid">
-              <button id="btn-ai-summarize" class="btn">Summarize Note</button>
-              <button id="btn-ai-autotag" class="btn">Auto-Tag Note</button>
+              <button id="btn-ai-summarize" class="btn">Summarize</button>
+              <button id="btn-ai-autotag" class="btn">Auto-Tag</button>
             </div>
             <div class="rewrite-row">
               <select id="select-rewrite-style" class="select-input" aria-label="Rewrite style">
@@ -197,126 +207,200 @@ function mountShell() {
               <button id="btn-ai-rewrite" class="btn">Rewrite</button>
             </div>
             <form id="form-note-qa" class="qa-row">
-              <input id="input-qa" class="text-input" type="text" placeholder="Ask a question about this note..." required />
+              <input id="input-qa" class="text-input" type="text" placeholder="Ask about this note..." />
               <button id="btn-ai-qa" type="submit" class="btn btn-primary">Ask</button>
             </form>
           </div>
 
-          <!-- Multi-Note Cloud Synthesis -->
           <div class="action-card">
             <div class="action-card-label">
-              <span>Multi-Note Synthesis (<span id="synth-count">0</span> selected)</span>
-              <span style="font-weight:500; text-transform:none; color:var(--sky-text);">Cloud Reasoning</span>
+              <span>Multi-Note Synthesis (<span id="synth-count">0</span>)</span>
+              <span style="font-weight:500; text-transform:none; color:var(--sky-text);">Cloud</span>
             </div>
-            <p style="font-size:0.74rem; color:var(--text-muted); line-height:1.4;">
-              Tick 2+ notes in the Vault (or click Select All) to synthesize cross-note themes and citations.
-            </p>
-            <div style="display:flex; gap:0.4rem;">
-              <button id="btn-select-all-synth" type="button" class="btn" style="font-size:0.73rem; padding:0.28rem 0.55rem;">Select All Notes</button>
-              <button id="btn-clear-synth" type="button" class="btn" style="font-size:0.73rem; padding:0.28rem 0.55rem;">Clear Selection</button>
+            <div style="display:flex; gap:0.38rem;">
+              <button id="btn-select-all-synth" type="button" class="btn" style="flex:1; font-size:0.72rem; padding:0.26rem 0.5rem;">Select All</button>
+              <button id="btn-clear-synth" type="button" class="btn" style="flex:1; font-size:0.72rem; padding:0.26rem 0.5rem;">Clear</button>
             </div>
             <form id="form-synthesis" class="qa-row">
-              <input id="input-synth-goal" class="text-input" type="text" placeholder="Optional focus (e.g. compare trade-offs)..." />
+              <input id="input-synth-goal" class="text-input" type="text" placeholder="Focus (optional)..." />
               <button id="btn-ai-synthesize" type="submit" class="btn btn-primary">Synthesize</button>
             </form>
           </div>
 
           <div id="ai-live-banner"></div>
-          <div id="ai-runs-feed" style="display:flex; flex-direction:column; gap:0.75rem;"></div>
+          <div id="ai-runs-feed" style="display:flex; flex-direction:column; gap:0.65rem;"></div>
         </div>
       </aside>
     </main>
 
-    <!-- MOBILE BOTTOM NAVIGATION -->
-    <nav class="mobile-tabs" aria-label="Mobile workspace sections">
-      <button class="mobile-tab-btn" data-tab="vault">Vault</button>
-      <button class="mobile-tab-btn active" data-tab="editor">Editor</button>
-      <button class="mobile-tab-btn" data-tab="ai">Hybrid AI</button>
+    <!-- ICON + LABEL MOBILE DOCK -->
+    <nav class="mobile-tabs" aria-label="Workspace navigation">
+      <button class="mobile-tab-btn" data-tab="vault">
+        <span id="mobile-vault-badge" class="tab-badge">0</span>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
+        <span>Vault</span>
+      </button>
+      <button class="mobile-tab-btn active" data-tab="editor">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+        <span>Editor</span>
+      </button>
+      <button class="mobile-tab-btn" data-tab="ai">
+        <span id="mobile-ai-badge" class="tab-badge">0</span>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3-1.9 5.8a2 2 0 0 1-1.3 1.3L3 12l5.8 1.9a2 2 0 0 1 1.3 1.3L12 21l1.9-5.8a2 2 0 0 1 1.3-1.3L21 12l-5.8-1.9a2 2 0 0 1-1.3-1.3Z"/></svg>
+        <span>Hybrid AI</span>
+      </button>
     </nav>
   `;
 }
 
-// ---------------- UI RENDER UPDATES ----------------
+// ---------------- RENDER UPDATES ----------------
 
 function renderTopStatus() {
-  const netEl = document.querySelector('#pill-network');
-  netEl.className = `status-pill ${state.online ? 'online' : 'offline'}`;
-  netEl.innerHTML = `<span class="dot"></span>${state.online ? 'Online' : 'Offline Mode'}`;
+  const dotEl = document.querySelector('#top-status-dot');
+  const labelEl = document.querySelector('#top-status-label');
+  dotEl.className = `status-dot ${state.online ? '' : 'offline'}`;
+  labelEl.textContent = state.online ? 'Ready' : 'Offline';
 
-  const nanoEl = document.querySelector('#pill-nano');
-  const warmBtn = document.querySelector('#btn-warmup-nano');
+  const isStrict = state.privacyMode === USER_PRIVACY_MODES.STRICT_LOCAL;
+  document.querySelector('#mode-prefer-local').className = `mode-btn ${!isStrict ? 'active-hybrid' : ''}`;
+  document.querySelector('#mode-only-local').className = `mode-btn ${isStrict ? 'active-private' : ''}`;
+
+  document.querySelector('#mode-explainer').innerHTML = isStrict
+    ? `<strong style="color:var(--emerald-text);">ONLY_ON_DEVICE:</strong> Strict privacy lock. Cloud fallback is refused.`
+    : `<strong style="color:var(--sky-text);">PREFER_ON_DEVICE:</strong> Tries local Gemini Nano first; falls back to Cloud seamlessly.`;
+
+  // Telemetry Popover Content
   const isNanoReady = state.nanoState === 'available' || state.nanoState === 'readily';
-  nanoEl.className = `status-pill ${isNanoReady ? 'ready' : ''}`;
+  const canDownloadNano = state.nanoState === 'downloadable' || state.nanoState === 'after-download';
+  const onDeviceCount = state.aiRuns.filter((r) => r.sourceLabel === 'On device').length;
+  const cloudCount = state.aiRuns.filter((r) => r.sourceLabel === 'Cloud').length;
 
-  if (state.nanoDownloadPct !== null) {
-    nanoEl.textContent = `Gemini Nano: Downloading ${state.nanoDownloadPct}%`;
-    warmBtn.style.display = 'none';
-  } else if (isNanoReady) {
-    nanoEl.textContent = 'Gemini Nano: Ready On-Device';
-    warmBtn.style.display = 'none';
-  } else if (state.nanoState === 'downloadable' || state.nanoState === 'after-download') {
-    nanoEl.textContent = 'Gemini Nano: Downloadable';
-    warmBtn.style.display = 'inline-flex';
+  let nanoText = 'Cloud Fallback Active';
+  if (state.nanoDownloadPct !== null) nanoText = `Downloading (${state.nanoDownloadPct}%)`;
+  else if (isNanoReady) nanoText = 'Ready On-Device';
+  else if (canDownloadNano) nanoText = 'Downloadable';
+
+  const telemetryPop = document.querySelector('#popover-telemetry');
+  telemetryPop.classList.toggle('open', state.openPopover === 'telemetry');
+  telemetryPop.innerHTML = `
+    <div class="popover-title">Hybrid Runtime Diagnostics</div>
+    <div class="telemetry-row">
+      <span>Network</span>
+      <span class="telemetry-val ${state.online ? 'ok' : 'warn'}">${state.online ? 'Online' : 'Offline (IndexedDB)'}</span>
+    </div>
+    <div class="telemetry-row">
+      <span>Inference Policy</span>
+      <span class="telemetry-val info">${escapeHtml(state.privacyMode)}</span>
+    </div>
+    <div class="telemetry-row">
+      <span>Gemini Nano</span>
+      <span class="telemetry-val ${isNanoReady ? 'ok' : 'info'}">${escapeHtml(nanoText)}</span>
+    </div>
+    <div class="telemetry-row">
+      <span>Firebase App Check</span>
+      <span class="telemetry-val ${state.appCheckOk ? 'ok' : 'warn'}">${state.appCheckOk ? 'Verified' : 'Pending'}</span>
+    </div>
+    <div class="telemetry-row">
+      <span>Provenance Ledger</span>
+      <span class="telemetry-val">${onDeviceCount} Local · ${cloudCount} Cloud</span>
+    </div>
+    ${
+      canDownloadNano
+        ? `<button id="btn-warmup-nano" class="btn btn-primary" style="width:100%; margin-top:0.25rem;">Download Local Gemini Nano</button>`
+        : ''
+    }
+  `;
+
+  document.querySelector('#btn-warmup-nano')?.addEventListener('click', async () => {
+    try {
+      state.nanoDownloadPct = 0;
+      renderTopStatus();
+      const res = await warmUpOnDeviceModel((pct) => {
+        state.nanoDownloadPct = pct;
+        renderTopStatus();
+      });
+      state.nanoDownloadPct = null;
+      state.nanoState = res.state;
+      renderTopStatus();
+    } catch (err) {
+      state.nanoDownloadPct = null;
+      state.aiErrorMsg = err.message;
+      renderTopStatus();
+      renderAIPane();
+    }
+  });
+
+  // Account Avatar & Popover
+  const accBtn = document.querySelector('#btn-account');
+  const accPop = document.querySelector('#popover-account');
+  accPop.classList.toggle('open', state.openPopover === 'account');
+
+  if (state.user && !state.user.isAnonymous && state.user.photoURL) {
+    accBtn.innerHTML = `<img src="${escapeHtml(state.user.photoURL)}" alt="Profile" />`;
+  } else if (state.user && !state.user.isAnonymous) {
+    const initial = (state.user.displayName || state.user.email || 'U')[0].toUpperCase();
+    accBtn.textContent = initial;
   } else {
-    nanoEl.textContent = 'Gemini Nano: Cloud Fallback Active';
-    warmBtn.style.display = 'none';
+    accBtn.innerHTML = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>`;
   }
 
-  const appCheckEl = document.querySelector('#pill-appcheck');
-  appCheckEl.className = `status-pill ${state.appCheckOk ? 'ready' : 'warn'}`;
-  appCheckEl.textContent = state.appCheckOk ? 'App Check Verified' : 'App Check Pending';
-
-  const btnPrefer = document.querySelector('#mode-prefer-local');
-  const btnOnly = document.querySelector('#mode-only-local');
-  const isStrict = state.privacyMode === USER_PRIVACY_MODES.STRICT_LOCAL;
-
-  btnPrefer.className = `mode-btn ${!isStrict ? 'active-hybrid' : ''}`;
-  btnOnly.className = `mode-btn ${isStrict ? 'active-private' : ''}`;
-
-  const explainer = document.querySelector('#mode-explainer');
-  explainer.innerHTML = isStrict
-    ? `<strong style="color:var(--emerald-text);">ONLY_ON_DEVICE active:</strong> Strict privacy lock. Cloud requests are blocked—notes never leave your browser.`
-    : `<strong style="color:var(--sky-text);">PREFER_ON_DEVICE active:</strong> Tries local Gemini Nano first for short notes; seamlessly falls back to Cloud when needed.`;
-
-  const authEl = document.querySelector('#auth-controls');
   if (state.user) {
-    const label = state.user.isAnonymous
-      ? `Guest (${state.user.uid.slice(0, 6)})`
+    const title = state.user.isAnonymous
+      ? 'Guest Session'
       : state.user.displayName || state.user.email || 'Signed In';
-    authEl.innerHTML = `
-      <span class="status-pill">${escapeHtml(label)}</span>
+    const sub = state.user.isAnonymous
+      ? `Offline-persisted UID · ${state.user.uid.slice(0, 6)}`
+      : state.user.email || 'Firebase Authenticated';
+
+    accPop.innerHTML = `
+      <div class="popover-title">Firebase Authentication</div>
+      <div style="font-size:0.82rem; font-weight:600;">${escapeHtml(title)}</div>
+      <div style="font-size:0.72rem; color:var(--text-muted); margin-top:-0.35rem;">${escapeHtml(sub)}</div>
       ${
         state.user.isAnonymous
-          ? `<button id="btn-google-login" class="btn" style="font-size:0.74rem; padding:0.3rem 0.6rem;">Google Sign-In</button>`
-          : `<button id="btn-logout" class="btn" style="font-size:0.74rem; padding:0.3rem 0.6rem;">Sign Out</button>`
+          ? `<button id="btn-google-login" class="btn btn-primary" style="width:100%; margin-top:0.25rem;">Continue with Google</button>`
+          : `<button id="btn-logout" class="btn" style="width:100%; margin-top:0.25rem;">Sign Out</button>`
       }
     `;
     document.querySelector('#btn-google-login')?.addEventListener('click', async () => {
+      state.openPopover = null;
+      renderTopStatus();
       try {
         await signInGoogle();
       } catch (err) {
-        state.aiErrorMsg = `Google Sign-In error: ${err.message}`;
+        state.aiErrorMsg = `Google Sign-In: ${err.message}`;
         renderAIPane();
       }
     });
     document.querySelector('#btn-logout')?.addEventListener('click', async () => {
+      state.openPopover = null;
       await logOutUser();
+      renderTopStatus();
     });
   } else {
-    authEl.innerHTML = `<button id="btn-guest-login" class="btn btn-primary" style="font-size:0.74rem;">Sign In</button>`;
-    document.querySelector('#btn-guest-login')?.addEventListener('click', () => signInGuest());
+    accPop.innerHTML = `
+      <div class="popover-title">Firebase Authentication</div>
+      <button id="btn-guest-login" class="btn btn-primary" style="width:100%;">Start Guest Session</button>
+    `;
+    document.querySelector('#btn-guest-login')?.addEventListener('click', async () => {
+      state.openPopover = null;
+      await signInGuest();
+      renderTopStatus();
+    });
   }
 }
 
 function renderVaultList() {
-  document.querySelector('#notes-count').textContent = String(state.notes.length);
+  const countStr = String(state.notes.length);
+  document.querySelector('#notes-count').textContent = countStr;
+  document.querySelector('#mobile-vault-badge').textContent = countStr;
   document.querySelector('#synth-count').textContent = String(state.selectedForSynthesis.size);
 
   const listEl = document.querySelector('#notes-list');
   const filtered = getFilteredNotes();
 
   if (filtered.length === 0) {
-    listEl.innerHTML = `<p style="padding:1rem; font-size:0.8rem; color:var(--text-muted); text-align:center;">No matching notes in IndexedDB.</p>`;
+    listEl.innerHTML = `<p style="padding:1rem; font-size:0.78rem; color:var(--text-muted); text-align:center;">No matching notes.</p>`;
     return;
   }
 
@@ -328,7 +412,7 @@ function renderVaultList() {
         <article class="note-card ${isActive ? 'active' : ''}" data-note-id="${note.id}">
           <div class="note-card-top">
             <div class="note-card-title">${note.pinned ? '📌 ' : ''}${escapeHtml(note.title)}</div>
-            <label class="synth-check-label" title="Include in Multi-Note Synthesis">
+            <label class="synth-check-label" title="Select for Multi-Note Synthesis">
               <input type="checkbox" class="synth-checkbox" data-synth-id="${note.id}" ${isChecked ? 'checked' : ''} />
               Synth
             </label>
@@ -336,11 +420,11 @@ function renderVaultList() {
           <div class="note-card-preview">${escapeHtml(note.content || 'Empty note...')}</div>
           ${
             note.tags.length
-              ? `<div class="tag-row">${note.tags.map((t) => `<span class="tag-chip">#${escapeHtml(t)}</span>`).join('')}</div>`
+              ? `<div class="tag-row">${note.tags.slice(0, 3).map((t) => `<span class="tag-chip">#${escapeHtml(t)}</span>`).join('')}</div>`
               : ''
           }
           <div class="note-card-meta">
-            <span>${note.wordCount || 0} words</span>
+            <span>${note.wordCount || 0}w</span>
             <span>${formatTimeAgo(note.updatedAt)}</span>
           </div>
         </article>
@@ -354,18 +438,15 @@ function renderVaultList() {
       state.activeNoteId = card.dataset.noteId;
       renderVaultList();
       populateEditorFromActiveNote();
-      if (window.innerWidth <= 860) switchMobileTab('editor');
+      if (window.innerWidth <= 880) switchMobileTab('editor');
     });
   });
 
   listEl.querySelectorAll('.synth-checkbox').forEach((box) => {
     box.addEventListener('change', (e) => {
       const id = e.target.dataset.synthId;
-      if (e.target.checked) {
-        state.selectedForSynthesis.add(id);
-      } else {
-        state.selectedForSynthesis.delete(id);
-      }
+      if (e.target.checked) state.selectedForSynthesis.add(id);
+      else state.selectedForSynthesis.delete(id);
       document.querySelector('#synth-count').textContent = String(state.selectedForSynthesis.size);
     });
   });
@@ -391,6 +472,7 @@ function populateEditorFromActiveNote() {
   contentEl.disabled = false;
   titleEl.value = note.title;
   contentEl.value = note.content;
+  autoResizeTitle(titleEl);
   pinBtn.textContent = note.pinned ? 'Unpin' : 'Pin';
   renderEditorTags(note.tags);
   updateEditorStats(note.content);
@@ -430,15 +512,17 @@ function updateEditorStats(content = '') {
 
   const hintEl = document.querySelector('#editor-routing-hint');
   if (state.privacyMode === USER_PRIVACY_MODES.STRICT_LOCAL) {
-    hintEl.textContent = 'Routing: Locked to On device (ONLY_ON_DEVICE)';
+    hintEl.textContent = 'Locked: On device only';
   } else if (chars > ON_DEVICE_CHAR_LIMIT) {
-    hintEl.textContent = `Long note (> ${ON_DEVICE_CHAR_LIMIT.toLocaleString()} chars) → Auto-routes to Cloud`;
+    hintEl.textContent = 'Long note → Cloud route';
   } else {
-    hintEl.textContent = 'Short note → Tries On device first, Cloud fallback';
+    hintEl.textContent = 'Short note → On device first';
   }
 }
 
 function renderAIPane() {
+  document.querySelector('#mobile-ai-badge').textContent = String(state.aiRuns.length);
+
   const buttons = document.querySelectorAll(
     '#btn-ai-summarize, #btn-ai-autotag, #btn-ai-rewrite, #btn-ai-qa, #btn-ai-synthesize'
   );
@@ -451,7 +535,7 @@ function renderAIPane() {
     bannerEl.innerHTML = `
       <div class="ai-status-banner">
         <span class="spinner"></span>
-        <span>${escapeHtml(state.aiStatusMsg || 'Running Hybrid AI inference...')}</span>
+        <span>${escapeHtml(state.aiStatusMsg || 'Running Hybrid AI...')}</span>
       </div>
     `;
   } else if (state.aiErrorMsg) {
@@ -467,8 +551,8 @@ function renderAIPane() {
   const feedEl = document.querySelector('#ai-runs-feed');
   if (state.aiRuns.length === 0) {
     feedEl.innerHTML = `
-      <p style="font-size:0.78rem; color:var(--text-muted); text-align:center; padding:1rem 0.5rem;">
-        Run Summarize, Auto-Tag, Rewrite, Q&amp;A, or Multi-Note Synthesis. Every response clearly displays whether it ran <strong>On device</strong> or in the <strong>Cloud</strong>.
+      <p style="font-size:0.76rem; color:var(--text-dim); text-align:center; padding:0.85rem 0.5rem; line-height:1.5;">
+        Every AI response displays a verified <strong>On device</strong> or <strong>Cloud</strong> provenance badge.
       </p>
     `;
     return;
@@ -477,23 +561,22 @@ function renderAIPane() {
   feedEl.innerHTML = state.aiRuns
     .map((run) => {
       const isOnDevice = run.sourceLabel === 'On device';
-      const badgeClass = isOnDevice ? 'on-device' : 'cloud';
       return `
         <article class="ai-result-card">
           <div class="ai-result-header">
             <span class="ai-action-name">${escapeHtml(run.action)}</span>
-            <span class="provenance-badge ${badgeClass}" title="Execution provenance reported by Firebase AI Logic">
+            <span class="provenance-badge ${isOnDevice ? 'on-device' : 'cloud'}">
               ${isOnDevice ? '⚡ On device' : '☁️ Cloud'}
             </span>
           </div>
           <div class="markdown-body">${renderSafeMarkdown(run.output)}</div>
           <div class="ai-meta-line">
-            <span>Mode: ${escapeHtml(run.modeUsed)}</span>
+            <span>${escapeHtml(run.modeUsed)}</span>
             <span>${run.latencyMs} ms · ${formatTimeAgo(run.createdAt)}</span>
           </div>
           <div class="result-actions">
-            <button class="btn" data-insert-output="${run.id}" style="font-size:0.72rem; padding:0.24rem 0.55rem;">Append to Active Note</button>
-            <button class="btn" data-save-new-note="${run.id}" style="font-size:0.72rem; padding:0.24rem 0.55rem;">Save as New Note</button>
+            <button class="btn" data-insert-output="${run.id}" style="font-size:0.7rem; padding:0.22rem 0.5rem;">Append to Note</button>
+            <button class="btn" data-save-new-note="${run.id}" style="font-size:0.7rem; padding:0.22rem 0.5rem;">Save as Note</button>
           </div>
         </article>
       `;
@@ -536,9 +619,11 @@ function switchMobileTab(tabName) {
   document.querySelectorAll('.mobile-tab-btn').forEach((btn) => {
     btn.classList.toggle('active', btn.dataset.tab === tabName);
   });
-}
 
-// ---------------- DATA HELPERS ----------------
+  if (tabName === 'editor') {
+    autoResizeTitle(document.querySelector('#editor-title'));
+  }
+}
 
 async function refreshNotes(preferredActiveId = null) {
   state.notes = await getAllNotes();
@@ -555,7 +640,7 @@ async function runAIAction(statusMessage, fn) {
   state.aiErrorMsg = '';
   state.aiStatusMsg = statusMessage;
   renderAIPane();
-  if (window.innerWidth <= 860) switchMobileTab('ai');
+  if (window.innerWidth <= 880) switchMobileTab('ai');
 
   try {
     await fn();
@@ -565,11 +650,10 @@ async function runAIAction(statusMessage, fn) {
   } finally {
     state.aiBusy = false;
     state.aiStatusMsg = '';
+    renderTopStatus();
     renderAIPane();
   }
 }
-
-// ---------------- EVENT BINDINGS ----------------
 
 function bindEvents() {
   window.addEventListener('online', () => {
@@ -579,6 +663,26 @@ function bindEvents() {
   window.addEventListener('offline', () => {
     state.online = false;
     renderTopStatus();
+  });
+
+  // Popover toggles & outside-click close
+  document.querySelector('#btn-telemetry').addEventListener('click', (e) => {
+    e.stopPropagation();
+    state.openPopover = state.openPopover === 'telemetry' ? null : 'telemetry';
+    renderTopStatus();
+  });
+
+  document.querySelector('#btn-account').addEventListener('click', (e) => {
+    e.stopPropagation();
+    state.openPopover = state.openPopover === 'account' ? null : 'account';
+    renderTopStatus();
+  });
+
+  document.addEventListener('click', (e) => {
+    if (state.openPopover && !e.target.closest('.popover-wrap')) {
+      state.openPopover = null;
+      renderTopStatus();
+    }
   });
 
   document.querySelector('#mode-prefer-local').addEventListener('click', async () => {
@@ -599,25 +703,6 @@ function bindEvents() {
     renderAIPane();
   });
 
-  document.querySelector('#btn-warmup-nano').addEventListener('click', async () => {
-    try {
-      state.nanoDownloadPct = 0;
-      renderTopStatus();
-      const res = await warmUpOnDeviceModel((pct) => {
-        state.nanoDownloadPct = pct;
-        renderTopStatus();
-      });
-      state.nanoDownloadPct = null;
-      state.nanoState = res.state;
-      renderTopStatus();
-    } catch (err) {
-      state.nanoDownloadPct = null;
-      state.aiErrorMsg = err.message;
-      renderTopStatus();
-      renderAIPane();
-    }
-  });
-
   document.querySelector('#btn-new-note').addEventListener('click', async () => {
     const created = await saveNote({
       title: 'Untitled Research Note',
@@ -626,9 +711,10 @@ function bindEvents() {
     });
     await refreshNotes(created.id);
     populateEditorFromActiveNote();
-    document.querySelector('#editor-title').focus();
-    document.querySelector('#editor-title').select();
-    if (window.innerWidth <= 860) switchMobileTab('editor');
+    const titleEl = document.querySelector('#editor-title');
+    if (window.innerWidth <= 880) switchMobileTab('editor');
+    titleEl.focus();
+    titleEl.select();
   });
 
   document.querySelector('#input-search').addEventListener('input', (e) => {
@@ -639,22 +725,30 @@ function bindEvents() {
   const scheduleAutoSave = () => {
     const note = getActiveNote();
     if (!note) return;
-    const title = document.querySelector('#editor-title').value;
+    const titleEl = document.querySelector('#editor-title');
+    autoResizeTitle(titleEl);
+    const title = titleEl.value.replace(/\n/g, ' ');
     const content = document.querySelector('#editor-content').value;
     updateEditorStats(content);
 
     const saveEl = document.querySelector('#save-indicator');
-    saveEl.textContent = 'Saving to IndexedDB...';
+    saveEl.textContent = 'Saving...';
 
     clearTimeout(saveDebounceTimer);
     saveDebounceTimer = setTimeout(async () => {
       await saveNote({ ...note, title, content });
       await refreshNotes(note.id);
-      saveEl.textContent = 'Saved offline in IndexedDB';
+      saveEl.textContent = 'Saved offline';
     }, 280);
   };
 
   document.querySelector('#editor-title').addEventListener('input', scheduleAutoSave);
+  document.querySelector('#editor-title').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      document.querySelector('#editor-content').focus();
+    }
+  });
   document.querySelector('#editor-content').addEventListener('input', scheduleAutoSave);
 
   document.querySelector('#input-add-tag').addEventListener('keydown', async (e) => {
@@ -693,32 +787,31 @@ function bindEvents() {
   document.querySelector('#btn-delete-note').addEventListener('click', async () => {
     const note = getActiveNote();
     if (!note) return;
-    if (!confirm(`Delete "${note.title}" from offline storage?`)) return;
+    if (!confirm(`Delete "${note.title}"?`)) return;
     state.selectedForSynthesis.delete(note.id);
     await deleteNote(note.id);
     await refreshNotes();
     populateEditorFromActiveNote();
   });
 
-  // AI Actions
   document.querySelector('#btn-ai-summarize').addEventListener('click', () => {
     const note = getActiveNote();
     if (!note?.content.trim()) {
-      state.aiErrorMsg = 'Write or select a note with content before summarizing.';
+      state.aiErrorMsg = 'Select or write a note before summarizing.';
       renderAIPane();
       return;
     }
-    runAIAction('Summarizing note via Hybrid AI...', () => summarizeNote(note, state.privacyMode));
+    runAIAction('Summarizing note...', () => summarizeNote(note, state.privacyMode));
   });
 
   document.querySelector('#btn-ai-autotag').addEventListener('click', () => {
     const note = getActiveNote();
     if (!note?.content.trim()) {
-      state.aiErrorMsg = 'Write or select a note with content before auto-tagging.';
+      state.aiErrorMsg = 'Select or write a note before auto-tagging.';
       renderAIPane();
       return;
     }
-    runAIAction('Extracting tags via Hybrid AI...', async () => {
+    runAIAction('Extracting tags...', async () => {
       const res = await generateTagsForNote(note, state.privacyMode);
       if (res.parsedTags.length > 0) {
         const updated = await saveNote({
@@ -734,12 +827,12 @@ function bindEvents() {
   document.querySelector('#btn-ai-rewrite').addEventListener('click', () => {
     const note = getActiveNote();
     if (!note?.content.trim()) {
-      state.aiErrorMsg = 'Write or select a note with content before rewriting.';
+      state.aiErrorMsg = 'Select or write a note before rewriting.';
       renderAIPane();
       return;
     }
     const style = document.querySelector('#select-rewrite-style').value;
-    runAIAction(`Rewriting note (${style})...`, () => rewriteNote(note, style, state.privacyMode));
+    runAIAction(`Rewriting (${style})...`, () => rewriteNote(note, style, state.privacyMode));
   });
 
   document.querySelector('#form-note-qa').addEventListener('submit', (e) => {
@@ -749,9 +842,7 @@ function bindEvents() {
     const question = inputEl.value.trim();
     if (!note?.content.trim() || !question) return;
     inputEl.value = '';
-    runAIAction('Answering question on active note...', () =>
-      askNoteQuestion(note, question, state.privacyMode)
-    );
+    runAIAction('Answering question...', () => askNoteQuestion(note, question, state.privacyMode));
   });
 
   document.querySelector('#btn-select-all-synth').addEventListener('click', () => {
@@ -768,7 +859,7 @@ function bindEvents() {
     e.preventDefault();
     const selectedNotes = state.notes.filter((n) => state.selectedForSynthesis.has(n.id));
     if (selectedNotes.length < 2) {
-      state.aiErrorMsg = 'Tick at least 2 notes in the Vault (or click "Select All Notes") to run Multi-Note Synthesis.';
+      state.aiErrorMsg = 'Select at least 2 notes in the Vault first.';
       renderAIPane();
       return;
     }
@@ -784,23 +875,24 @@ function bindEvents() {
     await clearAIRuns();
     state.aiRuns = [];
     state.aiErrorMsg = '';
+    renderTopStatus();
     renderAIPane();
   });
 
   document.querySelectorAll('.mobile-tab-btn').forEach((btn) => {
     btn.addEventListener('click', () => switchMobileTab(btn.dataset.tab));
   });
-}
 
-// ---------------- BOOTSTRAP ----------------
+  window.addEventListener('resize', () => {
+    autoResizeTitle(document.querySelector('#editor-title'));
+  });
+}
 
 async function init() {
   mountShell();
   bindEvents();
 
-  const savedMode = await getSetting('privacyMode', USER_PRIVACY_MODES.HYBRID_DEFAULT);
-  state.privacyMode = savedMode;
-
+  state.privacyMode = await getSetting('privacyMode', USER_PRIVACY_MODES.HYBRID_DEFAULT);
   state.notes = await ensureStarterNotes();
   state.activeNoteId = state.notes[0]?.id || null;
   state.aiRuns = await getRecentAIRuns(25);
@@ -810,7 +902,6 @@ async function init() {
   populateEditorFromActiveNote();
   renderAIPane();
 
-  // Check Chrome Gemini Nano & App Check asynchronously without blocking offline render
   checkOnDeviceModelStatus().then((res) => {
     state.nanoState = res.state;
     renderTopStatus();
