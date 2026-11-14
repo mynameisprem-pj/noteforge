@@ -3,11 +3,27 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#111827" />
+    <meta
+      name="description"
+      content="Offline-first intelligent notes and research companion powered by Firebase AI Logic with Gemini Nano on-device and Cloud fallback."
+    />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <link rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials" />
     <title>NoteForge — Hybrid AI Research Companion</title>
     <link rel="stylesheet" href="/src/style.css" />
   </head>
   <body>
     <div id="app"></div>
     <script type="module" src="/src/main.js"></script>
+    <script type="module">
+      if (import.meta.env.PROD && 'serviceWorker' in navigator) {
+        window.addEventListener('load', () => {
+          navigator.serviceWorker.register('/sw.js').catch((err) => {
+            console.warn('Service worker registration skipped:', err);
+          });
+        });
+      }
+    </script>
   </body>
 </html>

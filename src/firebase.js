@@ -31,6 +31,12 @@ const firebaseConfig = {
   appId: import.meta.env.VITE_FIREBASE_APP_ID
 };
 
+// Required by modern Chrome Prompt API to attest output safety & silence console warnings
+const PROMPT_API_OPTIONS = {
+  expectedInputs: [{ type: 'text', languages: ['en'] }],
+  expectedOutputs: [{ type: 'text', languages: ['en'] }]
+};
+
 export function isFirebaseConfigured() {
   return Boolean(
     firebaseConfig.apiKey &&
@@ -48,7 +54,7 @@ let appCheckInstance = null;
 
 if (typeof window !== 'undefined') {
   const debugToken = import.meta.env.VITE_APPCHECK_DEBUG_TOKEN?.trim();
-  if (import.meta.env.DEV || debugToken) {
+  if (import.meta.env.DEV || (debugToken && !debugToken.includes('your_'))) {
     self.FIREBASE_APPCHECK_DEBUG_TOKEN =
       debugToken && !debugToken.includes('your_') ? debugToken : true;
   }
@@ -57,7 +63,7 @@ if (typeof window !== 'undefined') {
   if (siteKey && !siteKey.includes('your_')) {
     appCheckInstance = initializeAppCheck(firebaseApp, {
       provider: new ReCaptchaV3Provider(siteKey),
-      isTokenAutoRefreshEnabled: true
+      isTokenAutoRefreshEnabled: navigator.onLine
     });
   }
 }
@@ -67,6 +73,9 @@ export const appCheck = appCheckInstance;
 export async function verifyAppCheckStatus() {
   if (!appCheckInstance) {
     return { ok: false, detail: 'Missing VITE_RECAPTCHA_V3_SITE_KEY in .env' };
+  }
+  if (!navigator.onLine) {
+    return { ok: true, detail: 'Offline mode (cached session)' };
   }
   try {
     const result = await getAppCheckToken(appCheckInstance, false);
@@ -108,14 +117,10 @@ export const HYBRID_MODES = {
 };
 
 export const CLOUD_MODELS = {
-  FAST_DEFAULT: 'gemini-3.5-flash-lite', // SDK v13 default cloud fallback
-  DEEP_SYNTHESIS: 'gemini-3.8-flash'     // Frontier reasoning for multi-note synthesis & long docs
+  FAST_DEFAULT: 'gemini-3.5-flash-lite',
+  DEEP_SYNTHESIS: 'gemini-3.8-flash'
 };
 
-/**
- * Creates a hybrid GenerativeModel instance.
- * When cloudModelName is omitted, Firebase AI Logic uses its v13 default (gemini-3.5-flash-lite).
- */
 export function createHybridModel(
   mode = InferenceMode.PREFER_ON_DEVICE,
   cloudModelName = CLOUD_MODELS.FAST_DEFAULT,
@@ -129,10 +134,13 @@ export function createHybridModel(
     }
   };
 
-  if (systemInstruction && mode !== InferenceMode.ONLY_IN_CLOUD) {
+  if (mode !== InferenceMode.ONLY_IN_CLOUD) {
     config.onDeviceParams = {
       createOptions: {
-        initialPrompts: [{ role: 'system', content: systemInstruction }]
+        ...PROMPT_API_OPTIONS,
+        ...(systemInstruction
+          ? { initialPrompts: [{ role: 'system', content: systemInstruction }] }
+          : {})
       }
     };
   }
@@ -140,12 +148,12 @@ export function createHybridModel(
   return getGenerativeModel(ai, config);
 }
 
-// Inspect Chrome built-in Gemini Nano availability
+// Inspect Chrome built-in Gemini Nano availability with explicit output language
 export async function checkOnDeviceModelStatus() {
   try {
     if (typeof LanguageModel !== 'undefined' && typeof LanguageModel.availability === 'function') {
-      const state = await LanguageModel.availability();
-      return { supported: true, state }; // 'available' | 'downloadable' | 'downloading' | 'unavailable'
+      const state = await LanguageModel.availability(PROMPT_API_OPTIONS);
+      return { supported: true, state };
     }
     return { supported: false, state: 'unavailable' };
   } catch (err) {
@@ -153,12 +161,13 @@ export async function checkOnDeviceModelStatus() {
   }
 }
 
-// Trigger Chrome Gemini Nano download with progress callback if 'downloadable'
+// Trigger Chrome Gemini Nano download with explicit output language & progress callback
 export async function warmUpOnDeviceModel(onProgress) {
   if (typeof LanguageModel === 'undefined' || typeof LanguageModel.create !== 'function') {
     throw new Error('Chrome Prompt API (LanguageModel) is not enabled in chrome://flags.');
   }
   const session = await LanguageModel.create({
+    ...PROMPT_API_OPTIONS,
     monitor(m) {
       m.addEventListener('downloadprogress', (e) => {
         if (typeof onProgress === 'function') {
