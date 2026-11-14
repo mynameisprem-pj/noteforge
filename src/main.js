@@ -11,6 +11,9 @@ import {
   warmUpOnDeviceModel
 } from './firebase.js';
 import {
+  GUEST_WORKSPACE_ID,
+  setActiveWorkspace,
+  syncGuestToAuthenticatedWorkspace,
   ensureStarterNotes,
   getAllNotes,
   saveNote,
@@ -934,15 +937,42 @@ async function init() {
   onAuthStateChanged(auth, async (user) => {
     if (user) {
       state.user = user;
-      renderTopStatus();
-    } else if (navigator.onLine) {
-      try {
-        await signInGuest();
-      } catch {
-        renderTopStatus();
+      if (!user.isAnonymous) {
+        await syncGuestToAuthenticatedWorkspace(user.uid);
+        setActiveWorkspace(user.uid);
+      } else {
+        setActiveWorkspace(GUEST_WORKSPACE_ID);
       }
-    } else {
+
+      state.selectedForSynthesis.clear();
+      state.notes = await ensureStarterNotes();
+      state.activeNoteId = state.notes[0]?.id || null;
+      state.aiRuns = await getRecentAIRuns(25);
+
       renderTopStatus();
+      renderNotesList();
+      populateEditorFromActiveNote();
+      renderAIPane();
+    } else {
+      state.user = null;
+      setActiveWorkspace(GUEST_WORKSPACE_ID);
+      state.selectedForSynthesis.clear();
+      state.notes = await ensureStarterNotes(GUEST_WORKSPACE_ID);
+      state.activeNoteId = state.notes[0]?.id || null;
+      state.aiRuns = await getRecentAIRuns(25, GUEST_WORKSPACE_ID);
+
+      renderTopStatus();
+      renderNotesList();
+      populateEditorFromActiveNote();
+      renderAIPane();
+
+      if (navigator.onLine) {
+        try {
+          await signInGuest();
+        } catch {
+          // Offline or blocked; Guest local workspace remains active
+        }
+      }
     }
   });
 }

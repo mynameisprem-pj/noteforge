@@ -6,6 +6,7 @@ import {
   browserPopupRedirectResolver,
   GoogleAuthProvider,
   signInWithPopup,
+  linkWithPopup,
   signInAnonymously,
   signOut,
   onAuthStateChanged
@@ -31,7 +32,6 @@ const firebaseConfig = {
   appId: import.meta.env.VITE_FIREBASE_APP_ID
 };
 
-// Required by modern Chrome Prompt API to attest output safety & silence console warnings
 const PROMPT_API_OPTIONS = {
   expectedInputs: [{ type: 'text', languages: ['en'] }],
   expectedOutputs: [{ type: 'text', languages: ['en'] }]
@@ -46,10 +46,8 @@ export function isFirebaseConfigured() {
   );
 }
 
-// 1. Initialize core Firebase App
 export const firebaseApp = initializeApp(firebaseConfig);
 
-// 2. Initialize App Check FIRST (with explicit debug token support)
 let appCheckInstance = null;
 
 if (typeof window !== 'undefined') {
@@ -91,7 +89,6 @@ export async function verifyAppCheckStatus() {
   }
 }
 
-// 3. Initialize Firebase Auth with IndexedDB persistence for offline support
 export const auth = initializeAuth(firebaseApp, {
   persistence: [indexedDBLocalPersistence, browserLocalPersistence],
   popupRedirectResolver: browserPopupRedirectResolver
@@ -100,11 +97,32 @@ export const auth = initializeAuth(firebaseApp, {
 const googleProvider = new GoogleAuthProvider();
 
 export const signInGuest = () => signInAnonymously(auth);
-export const signInGoogle = () => signInWithPopup(auth, googleProvider);
+
+/**
+ * Upgrades anonymous Guest session to Google when possible, or signs into existing Google account.
+ */
+export async function signInGoogle() {
+  if (auth.currentUser && auth.currentUser.isAnonymous) {
+    try {
+      const linked = await linkWithPopup(auth.currentUser, googleProvider, browserPopupRedirectResolver);
+      return linked;
+    } catch (err) {
+      // If this Google account was already used before, sign into it normally
+      if (
+        err?.code === 'auth/credential-already-in-use' ||
+        err?.code === 'auth/email-already-in-use'
+      ) {
+        return signInWithPopup(auth, googleProvider, browserPopupRedirectResolver);
+      }
+      throw err;
+    }
+  }
+  return signInWithPopup(auth, googleProvider, browserPopupRedirectResolver);
+}
+
 export const logOutUser = () => signOut(auth);
 export { onAuthStateChanged };
 
-// 4. Initialize Firebase AI Logic (Gemini Developer API + Hybrid Inference)
 export const ai = getAI(firebaseApp, {
   backend: new GoogleAIBackend()
 });
@@ -148,7 +166,6 @@ export function createHybridModel(
   return getGenerativeModel(ai, config);
 }
 
-// Inspect Chrome built-in Gemini Nano availability with explicit output language
 export async function checkOnDeviceModelStatus() {
   try {
     if (typeof LanguageModel !== 'undefined' && typeof LanguageModel.availability === 'function') {
@@ -161,7 +178,6 @@ export async function checkOnDeviceModelStatus() {
   }
 }
 
-// Trigger Chrome Gemini Nano download with explicit output language & progress callback
 export async function warmUpOnDeviceModel(onProgress) {
   if (typeof LanguageModel === 'undefined' || typeof LanguageModel.create !== 'function') {
     throw new Error('Chrome Prompt API (LanguageModel) is not enabled in chrome://flags.');
