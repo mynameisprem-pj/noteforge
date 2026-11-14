@@ -10,7 +10,7 @@ import {
   linkWithPopup,
   signInAnonymously,
   signOut,
-  onAuthStateChanged
+  onIdTokenChanged
 } from 'firebase/auth';
 import {
   initializeAppCheck,
@@ -122,7 +122,7 @@ export async function signInGoogle() {
 }
 
 export const logOutUser = () => signOut(auth);
-export { onAuthStateChanged };
+export { onIdTokenChanged };
 
 export const ai = getAI(firebaseApp, {
   backend: new GoogleAIBackend()

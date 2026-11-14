@@ -5,7 +5,7 @@ import {
   signInGuest,
   signInGoogle,
   logOutUser,
-  onAuthStateChanged,
+  onIdTokenChanged,
   verifyAppCheckStatus,
   checkOnDeviceModelStatus,
   warmUpOnDeviceModel
@@ -27,7 +27,6 @@ import {
 } from './db.js';
 import {
   USER_PRIVACY_MODES,
-  ON_DEVICE_CHAR_LIMIT,
   summarizeNote,
   generateTagsForNote,
   rewriteNote,
@@ -42,6 +41,18 @@ const ICONS = {
   saveNote: `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg>`,
   check: `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>`
 };
+
+let toastTimer = null;
+function showToast(message) {
+  const el = document.querySelector('#app-toast');
+  if (!el) return;
+  el.textContent = message;
+  el.classList.add('visible');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => {
+    el.classList.remove('visible');
+  }, 2600);
+}
 
 function flashButtonDone(btn, doneLabel) {
   if (!btn || btn.dataset.flashing === '1') return;
@@ -93,7 +104,8 @@ const state = {
   nanoDownloadPct: null,
   appCheckOk: false,
   user: null,
-  mobileTab: 'editor', // 'notes' | 'editor' | 'ai'
+  authBusy: false,
+  mobileTab: 'editor',
   openPopover: null
 };
 
@@ -157,14 +169,14 @@ function mountShell() {
         </div>
 
         <div class="popover-wrap">
-          <button id="btn-account" class="avatar-btn" aria-label="Account Menu" title="Account & Sign-In"></button>
-          <div id="popover-account" class="popover-card" style="width:245px;"></div>
+          <button id="btn-account" class="account-pill-btn guest-mode" aria-label="Account Menu">Sign in</button>
+          <div id="popover-account" class="popover-card" style="width:255px;"></div>
         </div>
       </div>
     </header>
 
     <main class="workspace">
-      <!-- PANE 1: NOTES LIBRARY -->
+      <!-- PANE 1: NOTES -->
       <aside id="pane-notes" class="pane">
         <div class="pane-header">
           <div class="pane-title-row">
@@ -176,7 +188,7 @@ function mountShell() {
         <div id="notes-list" class="notes-list"></div>
       </aside>
 
-      <!-- PANE 2: NOTE EDITOR -->
+      <!-- PANE 2: EDITOR -->
       <section id="pane-editor" class="pane editor-pane mobile-active">
         <div class="editor-toolbar">
           <span id="save-indicator" class="save-indicator">Saved offline</span>
@@ -196,7 +208,7 @@ function mountShell() {
           <textarea id="editor-content" class="content-textarea" placeholder="Capture research notes, field interviews, or drafts... Saved automatically to IndexedDB for instant offline access."></textarea>
           <div class="editor-footer">
             <span id="editor-stats">0 words · 0 chars</span>
-            <span id="editor-routing-hint" class="editor-routing-hint-text"></span>
+            <span id="workspace-scope-label">Local Guest Workspace</span>
           </div>
         </div>
       </section>
@@ -256,7 +268,6 @@ function mountShell() {
       </aside>
     </main>
 
-    <!-- ICON + LABEL MOBILE DOCK -->
     <nav class="mobile-tabs" aria-label="Workspace navigation">
       <button class="mobile-tab-btn" data-tab="notes">
         <span id="mobile-notes-badge" class="tab-badge">0</span>
@@ -273,7 +284,36 @@ function mountShell() {
         <span>Hybrid AI</span>
       </button>
     </nav>
+
+    <div id="app-toast" class="toast-banner" role="status" aria-live="polite"></div>
   `;
+}
+
+async function applyWorkspaceForUser(user) {
+  state.user = user;
+  const isGoogleUser = Boolean(user && !user.isAnonymous);
+
+  // 1. Update navbar account pill IMMEDIATELY (zero wait on network sync)
+  renderTopStatus();
+
+  if (isGoogleUser) {
+    setActiveWorkspace(user.uid);
+    await syncGuestToAuthenticatedWorkspace(user.uid);
+    state.notes = await ensureStarterNotes(user.uid);
+    state.aiRuns = await getRecentAIRuns(25, user.uid);
+  } else {
+    setActiveWorkspace(GUEST_WORKSPACE_ID);
+    state.notes = await ensureStarterNotes(GUEST_WORKSPACE_ID);
+    state.aiRuns = await getRecentAIRuns(25, GUEST_WORKSPACE_ID);
+  }
+
+  state.selectedForSynthesis.clear();
+  state.activeNoteId = state.notes[0]?.id || null;
+
+  renderTopStatus();
+  renderNotesList();
+  populateEditorFromActiveNote();
+  renderAIPane();
 }
 
 function renderTopStatus() {
@@ -287,9 +327,18 @@ function renderTopStatus() {
   document.querySelector('#mode-only-local').className = `mode-btn ${isStrict ? 'active-private' : ''}`;
 
   document.querySelector('#mode-explainer').innerHTML = isStrict
-    ? `<strong style="color:var(--emerald-text);">ONLY_ON_DEVICE:</strong> Strict privacy lock. Cloud fallback is refused.`
+    ? `<strong style="color:var(--emerald-text);">ONLY_ON_DEVICE:</strong> Strict privacy lock. Cloud AI &amp; sync are paused.`
     : `<strong style="color:var(--sky-text);">PREFER_ON_DEVICE:</strong> Tries local Gemini Nano first; falls back to Cloud seamlessly.`;
 
+  const isGoogleUser = Boolean(state.user && !state.user.isAnonymous);
+  const scopeEl = document.querySelector('#workspace-scope-label');
+  if (scopeEl) {
+    scopeEl.textContent = isGoogleUser
+      ? `Synced Workspace (${state.user.email || state.user.displayName || 'Google'})`
+      : 'Guest Workspace (Local Only)';
+  }
+
+  // Telemetry Popover
   const isNanoReady = state.nanoState === 'available' || state.nanoState === 'readily';
   const canDownloadNano = state.nanoState === 'downloadable' || state.nanoState === 'after-download';
   const onDeviceCount = state.aiRuns.filter((r) => r.sourceLabel === 'On device').length;
@@ -350,61 +399,82 @@ function renderTopStatus() {
     }
   });
 
+  // Account Pill & Popover — Clear Signed-In vs Guest Distinction
   const accBtn = document.querySelector('#btn-account');
   const accPop = document.querySelector('#popover-account');
   accPop.classList.toggle('open', state.openPopover === 'account');
 
-  if (state.user && !state.user.isAnonymous && state.user.photoURL) {
-    accBtn.innerHTML = `<img src="${escapeHtml(state.user.photoURL)}" alt="Profile" />`;
-  } else if (state.user && !state.user.isAnonymous) {
-    const initial = (state.user.displayName || state.user.email || 'U')[0].toUpperCase();
-    accBtn.textContent = initial;
+  if (state.authBusy) {
+    accBtn.className = 'account-pill-btn guest-mode';
+    accBtn.innerHTML = `<span>Syncing...</span>`;
+  } else if (isGoogleUser) {
+    const firstName = (state.user.displayName || state.user.email || 'Account').split(' ')[0];
+    const initial = firstName[0].toUpperCase();
+    const avatarInner = state.user.photoURL
+      ? `<img src="${escapeHtml(state.user.photoURL)}" alt="" referrerpolicy="no-referrer" />`
+      : escapeHtml(initial);
+
+    accBtn.className = 'account-pill-btn';
+    accBtn.innerHTML = `
+      <span class="account-avatar-mini">${avatarInner}</span>
+      <span class="account-name-text">${escapeHtml(firstName)}</span>
+    `;
   } else {
-    accBtn.innerHTML = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>`;
+    accBtn.className = 'account-pill-btn guest-mode';
+    accBtn.innerHTML = `
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg>
+      <span>Sign in</span>
+    `;
   }
 
-  if (state.user) {
-    const title = state.user.isAnonymous
-      ? 'Guest Session'
-      : state.user.displayName || state.user.email || 'Signed In';
-    const sub = state.user.isAnonymous
-      ? `Offline-persisted UID · ${state.user.uid.slice(0, 6)}`
-      : state.user.email || 'Firebase Authenticated';
-
+  if (isGoogleUser) {
     accPop.innerHTML = `
-      <div class="popover-title">Firebase Authentication</div>
-      <div style="font-size:0.82rem; font-weight:600;">${escapeHtml(title)}</div>
-      <div style="font-size:0.72rem; color:var(--text-muted); margin-top:-0.35rem;">${escapeHtml(sub)}</div>
-      ${
-        state.user.isAnonymous
-          ? `<button id="btn-google-login" class="btn btn-primary" style="width:100%; margin-top:0.25rem;">Continue with Google</button>`
-          : `<button id="btn-logout" class="btn" style="width:100%; margin-top:0.25rem;">Sign Out</button>`
-      }
+      <div class="popover-title">Signed In with Google</div>
+      <div style="font-size:0.84rem; font-weight:600;">${escapeHtml(state.user.displayName || 'Google Account')}</div>
+      <div style="font-size:0.72rem; color:var(--text-muted); margin-top:-0.35rem; word-break:break-all;">${escapeHtml(state.user.email || '')}</div>
+      <div style="font-size:0.71rem; color:var(--emerald-text);">✓ Cross-browser cloud sync active</div>
+      <button id="btn-logout" class="btn btn-ghost-danger" style="width:100%; margin-top:0.2rem;">Sign Out</button>
     `;
-    document.querySelector('#btn-google-login')?.addEventListener('click', async () => {
-      state.openPopover = null;
-      renderTopStatus();
-      try {
-        await signInGoogle();
-      } catch (err) {
-        state.aiErrorMsg = `Google Sign-In: ${err.message}`;
-        renderAIPane();
-      }
-    });
+
     document.querySelector('#btn-logout')?.addEventListener('click', async () => {
       state.openPopover = null;
-      await logOutUser();
+      state.authBusy = true;
       renderTopStatus();
+      await logOutUser();
+      state.authBusy = false;
+      await applyWorkspaceForUser(null);
+      showToast('Signed out · Switched to local Guest mode');
+      if (navigator.onLine) {
+        signInGuest().catch(() => {});
+      }
     });
   } else {
     accPop.innerHTML = `
-      <div class="popover-title">Firebase Authentication</div>
-      <button id="btn-guest-login" class="btn btn-primary" style="width:100%;">Start Guest Session</button>
+      <div class="popover-title">Guest Mode (Local Only)</div>
+      <div style="font-size:0.75rem; color:var(--text-muted); line-height:1.45;">
+        Notes are currently saved only in this browser. Sign in with Google to sync notes across devices.
+      </div>
+      <button id="btn-google-login" class="btn btn-primary" style="width:100%; margin-top:0.2rem;">Continue with Google</button>
     `;
-    document.querySelector('#btn-guest-login')?.addEventListener('click', async () => {
+
+    document.querySelector('#btn-google-login')?.addEventListener('click', async () => {
       state.openPopover = null;
-      await signInGuest();
+      state.authBusy = true;
       renderTopStatus();
+      try {
+        const cred = await signInGoogle();
+        state.authBusy = false;
+        await applyWorkspaceForUser(cred.user);
+        const name = cred.user.displayName || cred.user.email || 'Google Account';
+        showToast(`Signed in as ${name}`);
+      } catch (err) {
+        state.authBusy = false;
+        renderTopStatus();
+        if (err?.code !== 'auth/popup-closed-by-user') {
+          state.aiErrorMsg = `Sign-In failed: ${err.message}`;
+          renderAIPane();
+        }
+      }
     });
   }
 }
@@ -476,6 +546,13 @@ function populateEditorFromActiveNote() {
   const titleEl = document.querySelector('#editor-title');
   const contentEl = document.querySelector('#editor-content');
   const pinBtn = document.querySelector('#btn-pin-note');
+  const saveEl = document.querySelector('#save-indicator');
+
+  const isCloudSynced =
+    Boolean(state.user && !state.user.isAnonymous) &&
+    state.privacyMode !== USER_PRIVACY_MODES.STRICT_LOCAL &&
+    state.online;
+  saveEl.textContent = isCloudSynced ? 'Saved · Cloud synced' : 'Saved offline';
 
   if (!note) {
     titleEl.value = '';
@@ -528,15 +605,6 @@ function updateEditorStats(content = '') {
   const words = content.trim() ? content.trim().split(/\s+/).length : 0;
   const chars = content.length;
   document.querySelector('#editor-stats').textContent = `${words.toLocaleString()} words · ${chars.toLocaleString()} chars`;
-
-  const hintEl = document.querySelector('#editor-routing-hint');
-  if (state.privacyMode === USER_PRIVACY_MODES.STRICT_LOCAL) {
-    hintEl.textContent = 'Locked: On device only';
-  } else if (chars > ON_DEVICE_CHAR_LIMIT) {
-    hintEl.textContent = 'Long note → Cloud route';
-  } else {
-    hintEl.textContent = 'Short note → On device first';
-  }
 }
 
 function renderAIPane() {
@@ -690,6 +758,7 @@ function bindEvents() {
       populateEditorFromActiveNote();
     }
   });
+
   window.addEventListener('offline', () => {
     state.online = false;
     renderTopStatus();
@@ -717,12 +786,14 @@ function bindEvents() {
   document.querySelector('#mode-prefer-local').addEventListener('click', async () => {
     state.privacyMode = USER_PRIVACY_MODES.HYBRID_DEFAULT;
     setCloudSyncAllowed(true);
-    if (state.user && !state.user.isAnonymous) { syncCloudWorkspace(state.user.uid); }
     await setSetting('privacyMode', state.privacyMode);
     state.aiErrorMsg = '';
     renderTopStatus();
-    updateEditorStats(document.querySelector('#editor-content').value);
+    populateEditorFromActiveNote();
     renderAIPane();
+    if (state.user && !state.user.isAnonymous) {
+      syncCloudWorkspace(state.user.uid);
+    }
   });
 
   document.querySelector('#mode-only-local').addEventListener('click', async () => {
@@ -731,7 +802,7 @@ function bindEvents() {
     await setSetting('privacyMode', state.privacyMode);
     state.aiErrorMsg = '';
     renderTopStatus();
-    updateEditorStats(document.querySelector('#editor-content').value);
+    populateEditorFromActiveNote();
     renderAIPane();
   });
 
@@ -770,7 +841,10 @@ function bindEvents() {
     saveDebounceTimer = setTimeout(async () => {
       await saveNote({ ...note, title, content });
       await refreshNotes(note.id);
-      saveEl.textContent = state.user && !state.user.isAnonymous && state.privacyMode !== USER_PRIVACY_MODES.STRICT_LOCAL && state.online ? 'Saved · Cloud synced' : 'Saved offline';
+      saveEl.textContent =
+        state.user && !state.user.isAnonymous && state.privacyMode !== USER_PRIVACY_MODES.STRICT_LOCAL && state.online
+          ? 'Saved · Cloud synced'
+          : 'Saved offline';
     }, 280);
   };
 
@@ -824,6 +898,7 @@ function bindEvents() {
     await deleteNote(note.id);
     await refreshNotes();
     populateEditorFromActiveNote();
+    showToast('Note deleted');
   });
 
   document.querySelector('#btn-ai-summarize').addEventListener('click', () => {
@@ -926,6 +1001,7 @@ async function init() {
 
   state.privacyMode = await getSetting('privacyMode', USER_PRIVACY_MODES.HYBRID_DEFAULT);
   setCloudSyncAllowed(state.privacyMode !== USER_PRIVACY_MODES.STRICT_LOCAL);
+
   state.notes = await ensureStarterNotes();
   state.activeNoteId = state.notes[0]?.id || null;
   state.aiRuns = await getRecentAIRuns(25);
@@ -945,45 +1021,18 @@ async function init() {
     renderTopStatus();
   });
 
-  onAuthStateChanged(auth, async (user) => {
+  onIdTokenChanged(auth, async (user) => {
+    if (state.authBusy) return; // Handled directly by Sign-In / Sign-Out click handlers
     if (user) {
-      state.user = user;
-      if (!user.isAnonymous) {
-        await syncGuestToAuthenticatedWorkspace(user.uid);
-        setActiveWorkspace(user.uid);
-      } else {
-        setActiveWorkspace(GUEST_WORKSPACE_ID);
+      await applyWorkspaceForUser(user);
+    } else if (navigator.onLine) {
+      try {
+        await signInGuest();
+      } catch {
+        await applyWorkspaceForUser(null);
       }
-
-      state.selectedForSynthesis.clear();
-      state.notes = await ensureStarterNotes();
-      state.activeNoteId = state.notes[0]?.id || null;
-      state.aiRuns = await getRecentAIRuns(25);
-
-      renderTopStatus();
-      renderNotesList();
-      populateEditorFromActiveNote();
-      renderAIPane();
     } else {
-      state.user = null;
-      setActiveWorkspace(GUEST_WORKSPACE_ID);
-      state.selectedForSynthesis.clear();
-      state.notes = await ensureStarterNotes(GUEST_WORKSPACE_ID);
-      state.activeNoteId = state.notes[0]?.id || null;
-      state.aiRuns = await getRecentAIRuns(25, GUEST_WORKSPACE_ID);
-
-      renderTopStatus();
-      renderNotesList();
-      populateEditorFromActiveNote();
-      renderAIPane();
-
-      if (navigator.onLine) {
-        try {
-          await signInGuest();
-        } catch {
-          // Offline or blocked; Guest local workspace remains active
-        }
-      }
+      await applyWorkspaceForUser(null);
     }
   });
 }
