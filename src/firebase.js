@@ -43,13 +43,12 @@ export function isFirebaseConfigured() {
 // 1. Initialize core Firebase App
 export const firebaseApp = initializeApp(firebaseConfig);
 
-// 2. Initialize App Check FIRST (with explicit debug token support in dev / Codespaces)
+// 2. Initialize App Check FIRST (with explicit debug token support)
 let appCheckInstance = null;
 
 if (typeof window !== 'undefined') {
   const debugToken = import.meta.env.VITE_APPCHECK_DEBUG_TOKEN?.trim();
   if (import.meta.env.DEV || debugToken) {
-    // Pass the pre-registered UUID string if set, otherwise `true` so Firebase logs one
     self.FIREBASE_APPCHECK_DEBUG_TOKEN =
       debugToken && !debugToken.includes('your_') ? debugToken : true;
   }
@@ -83,7 +82,7 @@ export async function verifyAppCheckStatus() {
   }
 }
 
-// 3. Initialize Firebase Auth with IndexedDB persistence for true offline support
+// 3. Initialize Firebase Auth with IndexedDB persistence for offline support
 export const auth = initializeAuth(firebaseApp, {
   persistence: [indexedDBLocalPersistence, browserLocalPersistence],
   popupRedirectResolver: browserPopupRedirectResolver
@@ -103,31 +102,71 @@ export const ai = getAI(firebaseApp, {
 
 export const HYBRID_MODES = {
   PREFER_ON_DEVICE: InferenceMode.PREFER_ON_DEVICE,
-  ONLY_ON_DEVICE: InferenceMode.ONLY_ON_DEVICE
+  ONLY_ON_DEVICE: InferenceMode.ONLY_ON_DEVICE,
+  PREFER_IN_CLOUD: InferenceMode.PREFER_IN_CLOUD,
+  ONLY_IN_CLOUD: InferenceMode.ONLY_IN_CLOUD
 };
 
-export function createHybridModel(mode = InferenceMode.PREFER_ON_DEVICE, cloudModelName = 'gemini-2.5-flash') {
-  return getGenerativeModel(ai, {
+export const CLOUD_MODELS = {
+  FAST_DEFAULT: 'gemini-3.5-flash-lite', // SDK v13 default cloud fallback
+  DEEP_SYNTHESIS: 'gemini-3.8-flash'     // Frontier reasoning for multi-note synthesis & long docs
+};
+
+/**
+ * Creates a hybrid GenerativeModel instance.
+ * When cloudModelName is omitted, Firebase AI Logic uses its v13 default (gemini-3.5-flash-lite).
+ */
+export function createHybridModel(
+  mode = InferenceMode.PREFER_ON_DEVICE,
+  cloudModelName = CLOUD_MODELS.FAST_DEFAULT,
+  systemInstruction = ''
+) {
+  const config = {
     mode,
     inCloudParams: {
-      model: cloudModelName
+      model: cloudModelName,
+      ...(systemInstruction ? { systemInstruction } : {})
     }
-  });
+  };
+
+  if (systemInstruction && mode !== InferenceMode.ONLY_IN_CLOUD) {
+    config.onDeviceParams = {
+      createOptions: {
+        initialPrompts: [{ role: 'system', content: systemInstruction }]
+      }
+    };
+  }
+
+  return getGenerativeModel(ai, config);
 }
 
-// Helper to inspect Chrome built-in Gemini Nano availability
+// Inspect Chrome built-in Gemini Nano availability
 export async function checkOnDeviceModelStatus() {
   try {
     if (typeof LanguageModel !== 'undefined' && typeof LanguageModel.availability === 'function') {
       const state = await LanguageModel.availability();
       return { supported: true, state }; // 'available' | 'downloadable' | 'downloading' | 'unavailable'
     }
-    if (typeof window !== 'undefined' && window.ai?.languageModel?.capabilities) {
-      const caps = await window.ai.languageModel.capabilities();
-      return { supported: true, state: caps.available };
-    }
     return { supported: false, state: 'unavailable' };
   } catch (err) {
     return { supported: false, state: 'unavailable', error: err?.message };
   }
+}
+
+// Trigger Chrome Gemini Nano download with progress callback if 'downloadable'
+export async function warmUpOnDeviceModel(onProgress) {
+  if (typeof LanguageModel === 'undefined' || typeof LanguageModel.create !== 'function') {
+    throw new Error('Chrome Prompt API (LanguageModel) is not enabled in chrome://flags.');
+  }
+  const session = await LanguageModel.create({
+    monitor(m) {
+      m.addEventListener('downloadprogress', (e) => {
+        if (typeof onProgress === 'function') {
+          onProgress(Math.round((e.loaded || 0) * 100));
+        }
+      });
+    }
+  });
+  session.destroy();
+  return checkOnDeviceModelStatus();
 }
