@@ -556,6 +556,7 @@ function populateEditorFromActiveNote() {
 
   if (!note) {
     titleEl.value = '';
+    titleEl.placeholder = 'No notes — tap + New to create one';
     contentEl.value = '';
     titleEl.disabled = true;
     contentEl.disabled = true;
@@ -565,6 +566,7 @@ function populateEditorFromActiveNote() {
   }
 
   titleEl.disabled = false;
+  titleEl.placeholder = 'Untitled note...';
   contentEl.disabled = false;
   titleEl.value = note.title;
   contentEl.value = note.content;

@@ -3,6 +3,7 @@ import {
   firestoreDb,
   collection,
   doc,
+  getDoc,
   getDocs,
   setDoc,
   deleteDoc
@@ -259,26 +260,58 @@ export async function deleteNote(id) {
 export async function syncGuestToAuthenticatedWorkspace(googleUid) {
   if (!googleUid || googleUid === GUEST_WORKSPACE_ID) return;
 
-  // 1. Pull any existing notes from Cloud Firestore first (critical when signing in on a 2nd browser!)
-  await syncCloudWorkspace(googleUid);
+  const seededKey = `seeded_${googleUid}`;
+  let alreadyInitialized = await getSetting(seededKey, false);
+
+  // 1. Check Cloud Firestore user profile doc + pull existing cloud notes
+  if (canSyncWithCloud(googleUid)) {
+    try {
+      const profileRef = doc(firestoreDb, "users", googleUid);
+      const profileSnap = await getDoc(profileRef);
+      if (profileSnap.exists() && profileSnap.data()?.workspaceInitialized) {
+        alreadyInitialized = true;
+        await setSetting(seededKey, true);
+      }
+    } catch (err) {
+      console.warn("[Cloud Sync] Profile check skipped:", err?.message);
+    }
+
+    await syncCloudWorkspace(googleUid);
+  }
 
   const db = await dbPromise;
-  const guestNotes = await db.getAllFromIndex('notes', 'by-owner', GUEST_WORKSPACE_ID);
-  const userNotes = await db.getAllFromIndex('notes', 'by-owner', googleUid);
+  const guestNotes = await db.getAllFromIndex("notes", "by-owner", GUEST_WORKSPACE_ID);
+  const userNotes = await db.getAllFromIndex("notes", "by-owner", googleUid);
 
-  const tx = db.transaction(['notes', 'ai_runs'], 'readwrite');
-  const notesStore = tx.objectStore('notes');
-  const runsStore = tx.objectStore('ai_runs');
+  if (userNotes.length > 0 && !alreadyInitialized) {
+    alreadyInitialized = true;
+    await setSetting(seededKey, true);
+  }
 
-  if (userNotes.length === 0 && guestNotes.length > 0) {
+  const tx = db.transaction(["notes", "ai_runs"], "readwrite");
+  const notesStore = tx.objectStore("notes");
+  const runsStore = tx.objectStore("ai_runs");
+
+  if (!alreadyInitialized && userNotes.length === 0 && guestNotes.length > 0) {
+    // True first-time Google login: carry over current Guest notes with fresh user-scoped IDs
     for (const note of guestNotes) {
-      await notesStore.put({ ...note, ownerId: googleUid, needsCloudSync: true });
+      const clonedId = note.isStarter ? crypto.randomUUID() : note.id;
+      await notesStore.put({
+        ...note,
+        id: clonedId,
+        ownerId: googleUid,
+        needsCloudSync: true
+      });
+      if (!note.isStarter) {
+        await notesStore.delete(note.id);
+      }
     }
-    const guestRuns = await runsStore.index('by-owner').getAll(GUEST_WORKSPACE_ID);
+    const guestRuns = await runsStore.index("by-owner").getAll(GUEST_WORKSPACE_ID);
     for (const run of guestRuns) {
-      await runsStore.put({ ...run, ownerId: googleUid });
+      await runsStore.put({ ...run, id: crypto.randomUUID(), ownerId: googleUid });
     }
   } else {
+    // Returning / already-initialized Google user: ONLY move custom non-starter drafts created in Guest mode
     const customGuestDrafts = guestNotes.filter((n) => !n.isStarter);
     for (const draft of customGuestDrafts) {
       await notesStore.put({ ...draft, ownerId: googleUid, needsCloudSync: true });
@@ -287,8 +320,17 @@ export async function syncGuestToAuthenticatedWorkspace(googleUid) {
 
   await tx.done;
 
-  // 2. Push any newly migrated notes up to Firestore
-  await syncCloudWorkspace(googleUid);
+  // Mark workspace permanently initialized locally and in Firestore so deleted starter notes NEVER resurrect
+  await setSetting(seededKey, true);
+  if (canSyncWithCloud(googleUid)) {
+    try {
+      const profileRef = doc(firestoreDb, "users", googleUid);
+      await setDoc(profileRef, { workspaceInitialized: true, updatedAt: Date.now() }, { merge: true });
+    } catch (err) {
+      console.warn("[Cloud Sync] Could not persist workspaceInitialized flag:", err?.message);
+    }
+    await syncCloudWorkspace(googleUid);
+  }
 }
 
 // ---------------- AI PROVENANCE HISTORY ----------------
