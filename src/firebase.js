@@ -7,7 +7,6 @@ import {
   browserPopupRedirectResolver,
   GoogleAuthProvider,
   signInWithPopup,
-  linkWithPopup,
   signInAnonymously,
   signOut,
   onIdTokenChanged
@@ -102,22 +101,8 @@ export const signInGuest = () => signInAnonymously(auth);
 /**
  * Upgrades anonymous Guest session to Google when possible, or signs into existing Google account.
  */
-export async function signInGoogle() {
-  if (auth.currentUser && auth.currentUser.isAnonymous) {
-    try {
-      const linked = await linkWithPopup(auth.currentUser, googleProvider, browserPopupRedirectResolver);
-      return linked;
-    } catch (err) {
-      // If this Google account was already used before, sign into it normally
-      if (
-        err?.code === 'auth/credential-already-in-use' ||
-        err?.code === 'auth/email-already-in-use'
-      ) {
-        return signInWithPopup(auth, googleProvider, browserPopupRedirectResolver);
-      }
-      throw err;
-    }
-  }
+export function signInGoogle() {
+  // Single direct popup tied strictly to user click gesture — never triggers a 2nd popup or blocker
   return signInWithPopup(auth, googleProvider, browserPopupRedirectResolver);
 }
 

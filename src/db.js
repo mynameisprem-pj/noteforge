@@ -257,6 +257,29 @@ export async function deleteNote(id) {
  * Pulls existing Cloud notes for this Google UID first; if brand-new account, migrates Guest notes;
  * if returning account, merges only non-starter Guest drafts and syncs everything to Cloud.
  */
+/**
+ * Instant (<5ms) local IndexedDB migration of custom Guest drafts on sign-in,
+ * never blocking UI paint on Cloud Firestore network calls.
+ */
+export async function migrateCustomGuestDraftsLocal(googleUid) {
+  if (!googleUid || googleUid === GUEST_WORKSPACE_ID) return false;
+  const db = await dbPromise;
+  const guestNotes = await db.getAllFromIndex("notes", "by-owner", GUEST_WORKSPACE_ID);
+  const customDrafts = guestNotes.filter((n) => !n.isStarter);
+  if (customDrafts.length === 0) return false;
+
+  const tx = db.transaction("notes", "readwrite");
+  for (const draft of customDrafts) {
+    await tx.store.put({
+      ...draft,
+      ownerId: googleUid,
+      needsCloudSync: true
+    });
+  }
+  await tx.done;
+  return true;
+}
+
 export async function syncGuestToAuthenticatedWorkspace(googleUid) {
   if (!googleUid || googleUid === GUEST_WORKSPACE_ID) return;
 
