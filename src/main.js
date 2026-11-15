@@ -15,9 +15,11 @@ import {
   setActiveWorkspace,
   setCloudSyncAllowed,
   syncCloudWorkspace,
-  migrateCustomGuestDraftsLocal,
-  syncGuestToAuthenticatedWorkspace,
-  ensureStarterNotes,
+  ensureGuestStarterNotes,
+  loadSampleNotesIntoWorkspace,
+  getImportableGuestDrafts,
+  importGuestDraftsToUser,
+  dismissGuestDraftsImport,
   getAllNotes,
   saveNote,
   deleteNote,
@@ -94,6 +96,7 @@ const state = {
   notes: [],
   activeNoteId: null,
   selectedForSynthesis: new Set(),
+  pendingGuestDraftsCount: 0,
   searchQuery: '',
   privacyMode: USER_PRIVACY_MODES.HYBRID_DEFAULT,
   aiRuns: [],
@@ -186,6 +189,7 @@ function mountShell() {
           </div>
           <input id="input-search" class="search-input" type="search" placeholder="Search notes or #tags..." />
         </div>
+        <div id="guest-import-slot"></div>
         <div id="notes-list" class="notes-list"></div>
       </aside>
 
@@ -193,14 +197,18 @@ function mountShell() {
       <section id="pane-editor" class="pane editor-pane mobile-active">
         <div class="editor-toolbar">
           <span id="save-indicator" class="save-indicator">Saved offline</span>
-          <div style="display:flex; gap:0.38rem; align-items:center;">
+          <div id="editor-actions-group" style="display:flex; gap:0.38rem; align-items:center;">
             <button id="btn-pin-note" class="btn" style="font-size:0.73rem; padding:0.28rem 0.58rem;">Pin</button>
             <button id="btn-export-md" class="btn" style="font-size:0.73rem; padding:0.28rem 0.58rem;">.md</button>
             <button id="btn-delete-note" class="btn btn-ghost-danger" style="font-size:0.73rem; padding:0.28rem 0.58rem;">Delete</button>
           </div>
         </div>
 
-        <div class="editor-body">
+        <!-- Shown when workspace has 0 notes -->
+        <div id="editor-empty-state" class="editor-empty-overlay" style="display:none;"></div>
+
+        <!-- Shown when an active note is selected -->
+        <div id="editor-active-body" class="editor-body">
           <textarea id="editor-title" class="title-textarea" rows="1" placeholder="Untitled note..."></textarea>
           <div class="tags-editor-row">
             <div id="editor-tags" class="tag-row"></div>
@@ -209,7 +217,7 @@ function mountShell() {
           <textarea id="editor-content" class="content-textarea" placeholder="Capture research notes, field interviews, or drafts... Saved automatically to IndexedDB for instant offline access."></textarea>
           <div class="editor-footer">
             <span id="editor-stats">0 words · 0 chars</span>
-            <span id="workspace-scope-label">Local Guest Workspace</span>
+            <span id="workspace-scope-label">Guest Workspace (Local Only)</span>
           </div>
         </div>
       </section>
@@ -290,7 +298,9 @@ function mountShell() {
   `;
 }
 
-const LAST_AUTH_CACHE_KEY = "noteforge_auth_snapshot";
+// ---------------- SESSION SNAPSHOT & STALE-WHILE-REVALIDATE LOADER ----------------
+
+const LAST_AUTH_CACHE_KEY = 'noteforge_auth_snapshot';
 
 function saveAuthSnapshot(user) {
   try {
@@ -299,9 +309,9 @@ function saveAuthSnapshot(user) {
         LAST_AUTH_CACHE_KEY,
         JSON.stringify({
           uid: user.uid,
-          displayName: user.displayName || "",
-          email: user.email || "",
-          photoURL: user.photoURL || "",
+          displayName: user.displayName || '',
+          email: user.email || '',
+          photoURL: user.photoURL || '',
           isAnonymous: false
         })
       );
@@ -324,34 +334,61 @@ function readAuthSnapshot() {
 
 let activeSyncToken = 0;
 
-/**
- * Enterprise Stale-While-Revalidate Workspace Loader:
- * Phase 1 (<10ms): Paint local IndexedDB workspace immediately with zero network wait.
- * Phase 2 (Background): Reconcile Cloud Firestore silently and refresh UI only if remote changes exist.
- */
-async function applyWorkspaceForUser(user, { isExplicitSignIn = false } = {}) {
+async function createAndFocusBlankNote() {
+  const created = await saveNote({
+    title: 'Untitled Note',
+    content: '',
+    tags: [],
+    isStarter: false
+  });
+  await refreshNotes(created.id);
+  populateEditorFromActiveNote();
+  if (window.innerWidth <= 880) switchMobileTab('editor');
+  const titleEl = document.querySelector('#editor-title');
+  titleEl.focus();
+  titleEl.select();
+}
+
+async function handleImportGuestDrafts() {
+  if (!state.user || state.user.isAnonymous) return;
+  const importedCount = await importGuestDraftsToUser(state.user.uid);
+  const remaining = await getImportableGuestDrafts(state.user.uid);
+  state.pendingGuestDraftsCount = remaining.length;
+  await refreshNotes();
+  populateEditorFromActiveNote();
+  showToast(`Imported ${importedCount} Guest note${importedCount === 1 ? '' : 's'} to your account`);
+}
+
+async function handleLoadSampleNotes() {
+  const loaded = await loadSampleNotesIntoWorkspace();
+  state.notes = loaded;
+  state.activeNoteId = loaded[0]?.id || null;
+  renderNotesList();
+  populateEditorFromActiveNote();
+  showToast('Loaded 3 sample research notes');
+}
+
+async function applyWorkspaceForUser(user) {
   const syncToken = ++activeSyncToken;
   state.user = user;
   saveAuthSnapshot(user);
 
   const isGoogleUser = Boolean(user && !user.isAnonymous);
   const targetWorkspace = isGoogleUser ? user.uid : GUEST_WORKSPACE_ID;
-  const previousNoteIds = state.notes.map((n) => `${n.id}:${n.updatedAt}`).join("|");
 
   setActiveWorkspace(targetWorkspace);
+  state.selectedForSynthesis.clear();
 
-  // Move any unsaved Guest drafts locally in <5ms if user just clicked Sign In
-  if (isGoogleUser && isExplicitSignIn) {
-    await migrateCustomGuestDraftsLocal(user.uid);
+  // Phase 1 (<10ms): Read local IndexedDB immediately with zero network wait
+  if (isGoogleUser) {
+    state.notes = await getAllNotes(user.uid);
+    const drafts = await getImportableGuestDrafts(user.uid);
+    state.pendingGuestDraftsCount = drafts.length;
+  } else {
+    state.pendingGuestDraftsCount = 0;
+    state.notes = await ensureGuestStarterNotes();
   }
 
-  // PHASE 1: Instant Local IndexedDB Render (Zero network blocking!)
-  let localNotes = await getAllNotes(targetWorkspace);
-  if (!isGoogleUser && localNotes.length === 0) {
-    localNotes = await ensureStarterNotes(GUEST_WORKSPACE_ID);
-  }
-
-  state.notes = localNotes;
   if (!state.notes.some((n) => n.id === state.activeNoteId)) {
     state.activeNoteId = state.notes[0]?.id || null;
   }
@@ -362,26 +399,25 @@ async function applyWorkspaceForUser(user, { isExplicitSignIn = false } = {}) {
   populateEditorFromActiveNote();
   renderAIPane();
 
-  // PHASE 2: Non-Blocking Background Cloud Sync for Google Accounts
+  // Phase 2 (Background): Reconcile Cloud Firestore silently for Google accounts
   if (isGoogleUser && state.online && state.privacyMode !== USER_PRIVACY_MODES.STRICT_LOCAL) {
-    const saveEl = document.querySelector("#save-indicator");
-    if (saveEl) saveEl.textContent = "Syncing...";
+    const saveEl = document.querySelector('#save-indicator');
+    if (saveEl) saveEl.textContent = 'Syncing...';
 
     (async () => {
-      await syncGuestToAuthenticatedWorkspace(user.uid);
-      if (syncToken !== activeSyncToken) return; // Aborted by newer auth switch
-
-      // Seed starter notes ONLY if brand-new account still has 0 notes & was never initialized
-      const syncedNotes = await ensureStarterNotes(user.uid);
+      await syncCloudWorkspace(user.uid);
       if (syncToken !== activeSyncToken) return;
 
-      const nextFingerprint = syncedNotes.map((n) => `${n.id}:${n.updatedAt}`).join("|");
-      const currentFingerprint = state.notes.map((n) => `${n.id}:${n.updatedAt}`).join("|");
+      const syncedNotes = await getAllNotes(user.uid);
+      if (syncToken !== activeSyncToken) return;
 
-      if (nextFingerprint !== currentFingerprint || nextFingerprint !== previousNoteIds) {
+      const nextFingerprint = syncedNotes.map((n) => `${n.id}:${n.updatedAt}`).join('|');
+      const currentFingerprint = state.notes.map((n) => `${n.id}:${n.updatedAt}`).join('|');
+
+      if (nextFingerprint !== currentFingerprint) {
         const wasEditing =
-          document.activeElement === document.querySelector("#editor-title") ||
-          document.activeElement === document.querySelector("#editor-content");
+          document.activeElement === document.querySelector('#editor-title') ||
+          document.activeElement === document.querySelector('#editor-content');
 
         state.notes = syncedNotes;
         if (!state.notes.some((n) => n.id === state.activeNoteId)) {
@@ -393,13 +429,15 @@ async function applyWorkspaceForUser(user, { isExplicitSignIn = false } = {}) {
         }
       }
 
-      const latestSaveEl = document.querySelector("#save-indicator");
+      const latestSaveEl = document.querySelector('#save-indicator');
       if (latestSaveEl) {
-        latestSaveEl.textContent = "Saved · Cloud synced";
+        latestSaveEl.textContent = 'Saved · Cloud synced';
       }
     })();
   }
 }
+
+// ---------------- UI RENDERERS ----------------
 
 function renderTopStatus() {
   const dotEl = document.querySelector('#top-status-dot');
@@ -423,7 +461,6 @@ function renderTopStatus() {
       : 'Guest Workspace (Local Only)';
   }
 
-  // Telemetry Popover
   const isNanoReady = state.nanoState === 'available' || state.nanoState === 'readily';
   const canDownloadNano = state.nanoState === 'downloadable' || state.nanoState === 'after-download';
   const onDeviceCount = state.aiRuns.filter((r) => r.sourceLabel === 'On device').length;
@@ -484,7 +521,6 @@ function renderTopStatus() {
     }
   });
 
-  // Account Pill & Popover — Clear Signed-In vs Guest Distinction
   const accBtn = document.querySelector('#btn-account');
   const accPop = document.querySelector('#popover-account');
   accPop.classList.toggle('open', state.openPopover === 'account');
@@ -517,7 +553,7 @@ function renderTopStatus() {
       <div class="popover-title">Signed In with Google</div>
       <div style="font-size:0.84rem; font-weight:600;">${escapeHtml(state.user.displayName || 'Google Account')}</div>
       <div style="font-size:0.72rem; color:var(--text-muted); margin-top:-0.35rem; word-break:break-all;">${escapeHtml(state.user.email || '')}</div>
-      <div style="font-size:0.71rem; color:var(--emerald-text);">✓ Cross-browser cloud sync active</div>
+      <div style="font-size:0.71rem; color:var(--emerald-text);">✓ Personal cloud workspace active</div>
       <button id="btn-logout" class="btn btn-ghost-danger" style="width:100%; margin-top:0.2rem;">Sign Out</button>
     `;
 
@@ -537,7 +573,7 @@ function renderTopStatus() {
     accPop.innerHTML = `
       <div class="popover-title">Guest Mode (Local Only)</div>
       <div style="font-size:0.75rem; color:var(--text-muted); line-height:1.45;">
-        Notes are currently saved only in this browser. Sign in with Google to sync notes across devices.
+        Sign in with Google for a fresh personal cloud workspace synced across devices.
       </div>
       <button id="btn-google-login" class="btn btn-primary" style="width:100%; margin-top:0.2rem;">Continue with Google</button>
     `;
@@ -549,7 +585,7 @@ function renderTopStatus() {
       try {
         const cred = await signInGoogle();
         state.authBusy = false;
-        await applyWorkspaceForUser(cred.user, { isExplicitSignIn: true });
+        await applyWorkspaceForUser(cred.user);
         const name = cred.user.displayName || cred.user.email || 'Google Account';
         showToast(`Signed in as ${name}`);
       } catch (err) {
@@ -570,11 +606,65 @@ function renderNotesList() {
   document.querySelector('#mobile-notes-badge').textContent = countStr;
   document.querySelector('#synth-count').textContent = String(state.selectedForSynthesis.size);
 
+  const isGoogleUser = Boolean(state.user && !state.user.isAnonymous);
+  const importSlot = document.querySelector('#guest-import-slot');
+
+  // Show top import banner ONLY when returning Google user already has notes AND also has unsaved Guest drafts
+  if (isGoogleUser && state.notes.length > 0 && state.pendingGuestDraftsCount > 0) {
+    importSlot.innerHTML = `
+      <div class="guest-import-banner">
+        <span>You have <strong>${state.pendingGuestDraftsCount}</strong> unsaved note${state.pendingGuestDraftsCount === 1 ? '' : 's'} from Guest mode.</span>
+        <div class="guest-import-actions">
+          <button id="btn-banner-import-guest" class="btn btn-primary" style="flex:1; font-size:0.71rem; padding:0.24rem 0.5rem;">Import to Account</button>
+          <button id="btn-banner-dismiss-guest" class="btn" style="font-size:0.71rem; padding:0.24rem 0.5rem;">Dismiss</button>
+        </div>
+      </div>
+    `;
+    document.querySelector('#btn-banner-import-guest')?.addEventListener('click', handleImportGuestDrafts);
+    document.querySelector('#btn-banner-dismiss-guest')?.addEventListener('click', async () => {
+      await dismissGuestDraftsImport(state.user.uid);
+      state.pendingGuestDraftsCount = 0;
+      renderNotesList();
+      populateEditorFromActiveNote();
+    });
+  } else {
+    importSlot.innerHTML = '';
+  }
+
   const listEl = document.querySelector('#notes-list');
   const filtered = getFilteredNotes();
 
+  if (state.notes.length === 0) {
+    const hasGuestDrafts = isGoogleUser && state.pendingGuestDraftsCount > 0;
+    listEl.innerHTML = `
+      <div class="empty-workspace-card">
+        <div class="empty-workspace-title">${isGoogleUser ? 'Fresh Cloud Workspace' : 'No Notes Yet'}</div>
+        <div class="empty-workspace-sub">
+          ${
+            hasGuestDrafts
+              ? `Start clean or import the ${state.pendingGuestDraftsCount} custom note${state.pendingGuestDraftsCount === 1 ? '' : 's'} you wrote in Guest mode.`
+              : 'Your workspace is clean and ready. Create your first note or load sample research notes to test Hybrid AI.'
+          }
+        </div>
+        <div class="empty-workspace-actions">
+          <button id="btn-sidebar-create-first" class="btn btn-primary" style="width:100%;">+ Create First Note</button>
+          ${
+            hasGuestDrafts
+              ? `<button id="btn-sidebar-import-guest" class="btn" style="width:100%; border-color:var(--accent); color:#93c5fd;">Import ${state.pendingGuestDraftsCount} Guest Note${state.pendingGuestDraftsCount === 1 ? '' : 's'}</button>`
+              : ''
+          }
+          <button id="btn-sidebar-load-samples" class="btn" style="width:100%; font-size:0.73rem; color:var(--text-muted);">Load 3 Sample Notes</button>
+        </div>
+      </div>
+    `;
+    document.querySelector('#btn-sidebar-create-first')?.addEventListener('click', createAndFocusBlankNote);
+    document.querySelector('#btn-sidebar-import-guest')?.addEventListener('click', handleImportGuestDrafts);
+    document.querySelector('#btn-sidebar-load-samples')?.addEventListener('click', handleLoadSampleNotes);
+    return;
+  }
+
   if (filtered.length === 0) {
-    listEl.innerHTML = `<p style="padding:1rem; font-size:0.78rem; color:var(--text-muted); text-align:center;">No matching notes.</p>`;
+    listEl.innerHTML = `<p style="padding:1rem; font-size:0.78rem; color:var(--text-muted); text-align:center;">No matching notes for "${escapeHtml(state.searchQuery)}".</p>`;
     return;
   }
 
@@ -628,31 +718,59 @@ function renderNotesList() {
 
 function populateEditorFromActiveNote() {
   const note = getActiveNote();
+  const emptyOverlay = document.querySelector('#editor-empty-state');
+  const activeBody = document.querySelector('#editor-active-body');
+  const actionsGroup = document.querySelector('#editor-actions-group');
   const titleEl = document.querySelector('#editor-title');
   const contentEl = document.querySelector('#editor-content');
   const pinBtn = document.querySelector('#btn-pin-note');
   const saveEl = document.querySelector('#save-indicator');
 
+  const isGoogleUser = Boolean(state.user && !state.user.isAnonymous);
   const isCloudSynced =
-    Boolean(state.user && !state.user.isAnonymous) &&
-    state.privacyMode !== USER_PRIVACY_MODES.STRICT_LOCAL &&
-    state.online;
+    isGoogleUser && state.privacyMode !== USER_PRIVACY_MODES.STRICT_LOCAL && state.online;
   saveEl.textContent = isCloudSynced ? 'Saved · Cloud synced' : 'Saved offline';
 
   if (!note) {
-    titleEl.value = '';
-    titleEl.placeholder = 'No notes — tap + New to create one';
-    contentEl.value = '';
-    titleEl.disabled = true;
-    contentEl.disabled = true;
-    renderEditorTags([]);
-    updateEditorStats('');
+    activeBody.style.display = 'none';
+    actionsGroup.style.display = 'none';
+    emptyOverlay.style.display = 'flex';
+
+    const hasGuestDrafts = isGoogleUser && state.pendingGuestDraftsCount > 0;
+    emptyOverlay.innerHTML = `
+      <div style="max-width:360px; display:flex; flex-direction:column; align-items:center; gap:0.65rem;">
+        <div style="width:2.6rem; height:2.6rem; border-radius:0.75rem; background:var(--bg-elevated); border:1px solid var(--border); display:grid; place-items:center; color:#60a5fa;">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+        </div>
+        <h2 style="font-size:1.05rem; font-weight:700;">${isGoogleUser ? `Welcome, ${(state.user.displayName || 'Researcher').split(' ')[0]}` : 'Workspace Empty'}</h2>
+        <p style="font-size:0.8rem; color:var(--text-muted); line-height:1.5;">
+          ${
+            hasGuestDrafts
+              ? `Your Google workspace starts clean. You also have ${state.pendingGuestDraftsCount} custom note${state.pendingGuestDraftsCount === 1 ? '' : 's'} saved locally from Guest mode.`
+              : 'Start writing with a clean slate, or load 3 sample field-research notes to explore Hybrid AI summarization and multi-note synthesis.'
+          }
+        </p>
+        <div style="display:flex; flex-wrap:wrap; justify-content:center; gap:0.5rem; margin-top:0.25rem;">
+          <button id="btn-hero-create-first" class="btn btn-primary" style="padding:0.48rem 0.95rem;">+ Create First Note</button>
+          ${
+            hasGuestDrafts
+              ? `<button id="btn-hero-import-guest" class="btn" style="padding:0.48rem 0.95rem; border-color:var(--accent); color:#93c5fd;">Import ${state.pendingGuestDraftsCount} Guest Note${state.pendingGuestDraftsCount === 1 ? '' : 's'}</button>`
+              : ''
+          }
+          <button id="btn-hero-load-samples" class="btn" style="padding:0.48rem 0.85rem; color:var(--text-muted);">Load 3 Sample Notes</button>
+        </div>
+      </div>
+    `;
+    document.querySelector('#btn-hero-create-first')?.addEventListener('click', createAndFocusBlankNote);
+    document.querySelector('#btn-hero-import-guest')?.addEventListener('click', handleImportGuestDrafts);
+    document.querySelector('#btn-hero-load-samples')?.addEventListener('click', handleLoadSampleNotes);
     return;
   }
 
-  titleEl.disabled = false;
-  titleEl.placeholder = 'Untitled note...';
-  contentEl.disabled = false;
+  emptyOverlay.style.display = 'none';
+  activeBody.style.display = 'flex';
+  actionsGroup.style.display = 'flex';
+
   titleEl.value = note.title;
   contentEl.value = note.content;
   autoResizeTitle(titleEl);
@@ -781,7 +899,8 @@ function renderAIPane() {
       const created = await saveNote({
         title: `${run.action} — ${new Date(run.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`,
         content: run.output,
-        tags: ['ai-synthesis', run.sourceLabel === 'On device' ? 'on-device' : 'cloud']
+        tags: ['ai-synthesis', run.sourceLabel === 'On device' ? 'on-device' : 'cloud'],
+        isStarter: false
       });
       await refreshNotes(created.id);
       populateEditorFromActiveNote();
@@ -901,19 +1020,7 @@ function bindEvents() {
     renderAIPane();
   });
 
-  document.querySelector('#btn-new-note').addEventListener('click', async () => {
-    const created = await saveNote({
-      title: 'Untitled Research Note',
-      content: '',
-      tags: []
-    });
-    await refreshNotes(created.id);
-    populateEditorFromActiveNote();
-    const titleEl = document.querySelector('#editor-title');
-    if (window.innerWidth <= 880) switchMobileTab('editor');
-    titleEl.focus();
-    titleEl.select();
-  });
+  document.querySelector('#btn-new-note').addEventListener('click', createAndFocusBlankNote);
 
   document.querySelector('#input-search').addEventListener('input', (e) => {
     state.searchQuery = e.target.value;
@@ -1094,19 +1201,21 @@ async function init() {
   mountShell();
   bindEvents();
 
-  state.privacyMode = await getSetting("privacyMode", USER_PRIVACY_MODES.HYBRID_DEFAULT);
+  state.privacyMode = await getSetting('privacyMode', USER_PRIVACY_MODES.HYBRID_DEFAULT);
   setCloudSyncAllowed(state.privacyMode !== USER_PRIVACY_MODES.STRICT_LOCAL);
 
-  // Instant Frame-1 Boot: restore last known workspace from local snapshot in <10ms (no Guest flash!)
+  // Instant Frame-1 Boot (<10ms)
   const cachedUser = readAuthSnapshot();
   if (cachedUser?.uid) {
     state.user = cachedUser;
     setActiveWorkspace(cachedUser.uid);
     state.notes = await getAllNotes(cachedUser.uid);
+    const drafts = await getImportableGuestDrafts(cachedUser.uid);
+    state.pendingGuestDraftsCount = drafts.length;
     state.aiRuns = await getRecentAIRuns(25, cachedUser.uid);
   } else {
     setActiveWorkspace(GUEST_WORKSPACE_ID);
-    state.notes = await ensureStarterNotes(GUEST_WORKSPACE_ID);
+    state.notes = await ensureGuestStarterNotes();
     state.aiRuns = await getRecentAIRuns(25, GUEST_WORKSPACE_ID);
   }
 
