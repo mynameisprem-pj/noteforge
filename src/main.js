@@ -34,6 +34,7 @@ import {
   generateTagsForNote,
   rewriteNote,
   askNoteQuestion,
+  extractNoteFromImage,
   synthesizeMultipleNotes
 } from './ai-service.js';
 
@@ -42,6 +43,7 @@ marked.setOptions({ breaks: true, gfm: true });
 const ICONS = {
   append: `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M5 12h14"/></svg>`,
   saveNote: `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg>`,
+  camera: `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/></svg>`,
   check: `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>`
 };
 
@@ -70,6 +72,43 @@ function flashButtonDone(btn, doneLabel) {
     btn.innerHTML = originalHtml;
     delete btn.dataset.flashing;
   }, 1800);
+}
+
+/**
+ * Compresses large camera/desktop photos to max 1280px JPEG in-browser
+ * so multimodal inference is fast and light on bandwidth/memory.
+ */
+function compressImageFileToBase64(file, maxDim = 1280, quality = 0.84) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('Could not read selected image file.'));
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error('Selected file is not a valid image.'));
+      img.onload = () => {
+        let { width, height } = img;
+        if (width > maxDim || height > maxDim) {
+          const scale = Math.min(maxDim / width, maxDim / height);
+          width = Math.round(width * scale);
+          height = Math.round(height * scale);
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0, width, height);
+        const dataUrl = canvas.toDataURL('image/jpeg', quality);
+        const base64Data = dataUrl.split(',')[1];
+        resolve({
+          base64Data,
+          mimeType: 'image/jpeg',
+          fileName: file.name || 'captured-image.jpg'
+        });
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
 }
 
 function renderSafeMarkdown(mdText = '') {
@@ -103,6 +142,7 @@ const state = {
   aiBusy: false,
   aiStatusMsg: '',
   aiErrorMsg: '',
+  streamingRun: null, // { action, text, sourceLabel, modeUsed }
   online: navigator.onLine,
   nanoState: 'checking...',
   nanoDownloadPct: null,
@@ -179,6 +219,9 @@ function mountShell() {
       </div>
     </header>
 
+    <!-- Hidden Multimodal Image Input (supports Mobile Camera + File Picker) -->
+    <input id="input-scan-image" type="file" accept="image/*" style="display:none;" />
+
     <main class="workspace">
       <!-- PANE 1: NOTES -->
       <aside id="pane-notes" class="pane">
@@ -198,23 +241,24 @@ function mountShell() {
         <div class="editor-toolbar">
           <span id="save-indicator" class="save-indicator">Saved offline</span>
           <div id="editor-actions-group" style="display:flex; gap:0.38rem; align-items:center;">
+            <button id="btn-scan-image" class="btn btn-scan-image" title="Extract handwritten notes, whiteboards, or tables from an image using Hybrid Multimodal AI" style="font-size:0.73rem; padding:0.28rem 0.58rem;">
+              ${ICONS.camera}<span>Scan Image</span>
+            </button>
             <button id="btn-pin-note" class="btn" style="font-size:0.73rem; padding:0.28rem 0.58rem;">Pin</button>
             <button id="btn-export-md" class="btn" style="font-size:0.73rem; padding:0.28rem 0.58rem;">.md</button>
             <button id="btn-delete-note" class="btn btn-ghost-danger" style="font-size:0.73rem; padding:0.28rem 0.58rem;">Delete</button>
           </div>
         </div>
 
-        <!-- Shown when workspace has 0 notes -->
         <div id="editor-empty-state" class="editor-empty-overlay" style="display:none;"></div>
 
-        <!-- Shown when an active note is selected -->
         <div id="editor-active-body" class="editor-body">
           <textarea id="editor-title" class="title-textarea" rows="1" placeholder="Untitled note..."></textarea>
           <div class="tags-editor-row">
             <div id="editor-tags" class="tag-row"></div>
             <input id="input-add-tag" class="tag-input" type="text" placeholder="+ add tag" />
           </div>
-          <textarea id="editor-content" class="content-textarea" placeholder="Capture research notes, field interviews, or drafts... Saved automatically to IndexedDB for instant offline access."></textarea>
+          <textarea id="editor-content" class="content-textarea" placeholder="Capture research notes, scan whiteboard photos, or write drafts... Saved automatically to IndexedDB for instant offline access."></textarea>
           <div class="editor-footer">
             <span id="editor-stats">0 words · 0 chars</span>
             <span id="workspace-scope-label">Guest Workspace (Local Only)</span>
@@ -242,6 +286,9 @@ function mountShell() {
               <button id="btn-ai-summarize" class="btn">Summarize</button>
               <button id="btn-ai-autotag" class="btn">Auto-Tag</button>
             </div>
+            <button id="btn-ai-scan-image" type="button" class="btn btn-scan-image" style="width:100%;">
+              ${ICONS.camera}<span>Scan Whiteboard / Photo to Note</span>
+            </button>
             <div class="rewrite-row">
               <select id="select-rewrite-style" class="select-input" aria-label="Rewrite style">
                 <option value="clarity">Rewrite: Crisp & Clear</option>
@@ -272,6 +319,7 @@ function mountShell() {
           </div>
 
           <div id="ai-live-banner"></div>
+          <div id="ai-live-stream-slot"></div>
           <div id="ai-runs-feed" style="display:flex; flex-direction:column; gap:0.65rem;"></div>
         </div>
       </aside>
@@ -349,6 +397,14 @@ async function createAndFocusBlankNote() {
   titleEl.select();
 }
 
+function triggerImageScanPicker() {
+  const input = document.querySelector('#input-scan-image');
+  if (input && !state.aiBusy) {
+    input.value = '';
+    input.click();
+  }
+}
+
 async function handleImportGuestDrafts() {
   if (!state.user || state.user.isAnonymous) return;
   const importedCount = await importGuestDraftsToUser(state.user.uid);
@@ -379,7 +435,6 @@ async function applyWorkspaceForUser(user) {
   setActiveWorkspace(targetWorkspace);
   state.selectedForSynthesis.clear();
 
-  // Phase 1 (<10ms): Read local IndexedDB immediately with zero network wait
   if (isGoogleUser) {
     state.notes = await getAllNotes(user.uid);
     const drafts = await getImportableGuestDrafts(user.uid);
@@ -399,7 +454,6 @@ async function applyWorkspaceForUser(user) {
   populateEditorFromActiveNote();
   renderAIPane();
 
-  // Phase 2 (Background): Reconcile Cloud Firestore silently for Google accounts
   if (isGoogleUser && state.online && state.privacyMode !== USER_PRIVACY_MODES.STRICT_LOCAL) {
     const saveEl = document.querySelector('#save-indicator');
     if (saveEl) saveEl.textContent = 'Syncing...';
@@ -609,7 +663,6 @@ function renderNotesList() {
   const isGoogleUser = Boolean(state.user && !state.user.isAnonymous);
   const importSlot = document.querySelector('#guest-import-slot');
 
-  // Show top import banner ONLY when returning Google user already has notes AND also has unsaved Guest drafts
   if (isGoogleUser && state.notes.length > 0 && state.pendingGuestDraftsCount > 0) {
     importSlot.innerHTML = `
       <div class="guest-import-banner">
@@ -643,11 +696,12 @@ function renderNotesList() {
           ${
             hasGuestDrafts
               ? `Start clean or import the ${state.pendingGuestDraftsCount} custom note${state.pendingGuestDraftsCount === 1 ? '' : 's'} you wrote in Guest mode.`
-              : 'Your workspace is clean and ready. Create your first note or load sample research notes to test Hybrid AI.'
+              : 'Your workspace is clean and ready. Create your first note, scan a photo, or load sample research notes.'
           }
         </div>
         <div class="empty-workspace-actions">
           <button id="btn-sidebar-create-first" class="btn btn-primary" style="width:100%;">+ Create First Note</button>
+          <button id="btn-sidebar-scan-first" class="btn btn-scan-image" style="width:100%;">${ICONS.camera}<span>Scan Image to Note</span></button>
           ${
             hasGuestDrafts
               ? `<button id="btn-sidebar-import-guest" class="btn" style="width:100%; border-color:var(--accent); color:#93c5fd;">Import ${state.pendingGuestDraftsCount} Guest Note${state.pendingGuestDraftsCount === 1 ? '' : 's'}</button>`
@@ -658,6 +712,7 @@ function renderNotesList() {
       </div>
     `;
     document.querySelector('#btn-sidebar-create-first')?.addEventListener('click', createAndFocusBlankNote);
+    document.querySelector('#btn-sidebar-scan-first')?.addEventListener('click', triggerImageScanPicker);
     document.querySelector('#btn-sidebar-import-guest')?.addEventListener('click', handleImportGuestDrafts);
     document.querySelector('#btn-sidebar-load-samples')?.addEventListener('click', handleLoadSampleNotes);
     return;
@@ -738,7 +793,7 @@ function populateEditorFromActiveNote() {
 
     const hasGuestDrafts = isGoogleUser && state.pendingGuestDraftsCount > 0;
     emptyOverlay.innerHTML = `
-      <div style="max-width:360px; display:flex; flex-direction:column; align-items:center; gap:0.65rem;">
+      <div style="max-width:380px; display:flex; flex-direction:column; align-items:center; gap:0.65rem;">
         <div style="width:2.6rem; height:2.6rem; border-radius:0.75rem; background:var(--bg-elevated); border:1px solid var(--border); display:grid; place-items:center; color:#60a5fa;">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
         </div>
@@ -747,11 +802,12 @@ function populateEditorFromActiveNote() {
           ${
             hasGuestDrafts
               ? `Your Google workspace starts clean. You also have ${state.pendingGuestDraftsCount} custom note${state.pendingGuestDraftsCount === 1 ? '' : 's'} saved locally from Guest mode.`
-              : 'Start writing with a clean slate, or load 3 sample field-research notes to explore Hybrid AI summarization and multi-note synthesis.'
+              : 'Start writing with a clean slate, scan a whiteboard/clipboard photo, or load 3 sample field-research notes.'
           }
         </p>
         <div style="display:flex; flex-wrap:wrap; justify-content:center; gap:0.5rem; margin-top:0.25rem;">
           <button id="btn-hero-create-first" class="btn btn-primary" style="padding:0.48rem 0.95rem;">+ Create First Note</button>
+          <button id="btn-hero-scan-first" class="btn btn-scan-image" style="padding:0.48rem 0.9rem;">${ICONS.camera}<span>Scan Image</span></button>
           ${
             hasGuestDrafts
               ? `<button id="btn-hero-import-guest" class="btn" style="padding:0.48rem 0.95rem; border-color:var(--accent); color:#93c5fd;">Import ${state.pendingGuestDraftsCount} Guest Note${state.pendingGuestDraftsCount === 1 ? '' : 's'}</button>`
@@ -762,6 +818,7 @@ function populateEditorFromActiveNote() {
       </div>
     `;
     document.querySelector('#btn-hero-create-first')?.addEventListener('click', createAndFocusBlankNote);
+    document.querySelector('#btn-hero-scan-first')?.addEventListener('click', triggerImageScanPicker);
     document.querySelector('#btn-hero-import-guest')?.addEventListener('click', handleImportGuestDrafts);
     document.querySelector('#btn-hero-load-samples')?.addEventListener('click', handleLoadSampleNotes);
     return;
@@ -812,11 +869,44 @@ function updateEditorStats(content = '') {
   document.querySelector('#editor-stats').textContent = `${words.toLocaleString()} words · ${chars.toLocaleString()} chars`;
 }
 
+/**
+ * Fast isolated DOM update for live token streaming so existing history cards don't flicker.
+ */
+function renderLiveStreamSlot() {
+  const slotEl = document.querySelector('#ai-live-stream-slot');
+  if (!slotEl) return;
+
+  if (!state.streamingRun || !state.streamingRun.text) {
+    slotEl.innerHTML = '';
+    return;
+  }
+
+  const { action, text, sourceLabel, modeUsed } = state.streamingRun;
+  const isOnDevice = sourceLabel === 'On device';
+  const badgeHtml = sourceLabel
+    ? `<span class="provenance-badge ${isOnDevice ? 'on-device' : 'cloud'}">${isOnDevice ? '⚡ On device' : '☁️ Cloud'}</span>`
+    : `<span class="provenance-badge cloud">Streaming...</span>`;
+
+  slotEl.innerHTML = `
+    <article class="ai-result-card streaming-live">
+      <div class="ai-result-header">
+        <span class="ai-action-name">${escapeHtml(action)}</span>
+        ${badgeHtml}
+      </div>
+      <div class="markdown-body streaming-cursor">${renderSafeMarkdown(text)}</div>
+      <div class="ai-meta-line">
+        <span>${escapeHtml(modeUsed || '')}</span>
+        <span>Generating live...</span>
+      </div>
+    </article>
+  `;
+}
+
 function renderAIPane() {
   document.querySelector('#mobile-ai-badge').textContent = String(state.aiRuns.length);
 
   const buttons = document.querySelectorAll(
-    '#btn-ai-summarize, #btn-ai-autotag, #btn-ai-rewrite, #btn-ai-qa, #btn-ai-synthesize'
+    '#btn-ai-summarize, #btn-ai-autotag, #btn-ai-scan-image, #btn-scan-image, #btn-ai-rewrite, #btn-ai-qa, #btn-ai-synthesize'
   );
   buttons.forEach((b) => {
     b.disabled = state.aiBusy;
@@ -840,11 +930,13 @@ function renderAIPane() {
     bannerEl.innerHTML = '';
   }
 
+  renderLiveStreamSlot();
+
   const feedEl = document.querySelector('#ai-runs-feed');
-  if (state.aiRuns.length === 0) {
+  if (state.aiRuns.length === 0 && !state.streamingRun) {
     feedEl.innerHTML = `
       <p style="font-size:0.76rem; color:var(--text-dim); text-align:center; padding:0.85rem 0.5rem; line-height:1.5;">
-        Every AI response displays a verified <strong>On device</strong> or <strong>Cloud</strong> provenance badge.
+        Every AI response streams live and displays a verified <strong>On device</strong> or <strong>Cloud</strong> provenance badge.
       </p>
     `;
     return;
@@ -934,19 +1026,31 @@ async function refreshNotes(preferredActiveId = null) {
   renderNotesList();
 }
 
-async function runAIAction(statusMessage, fn) {
+async function runAIAction(actionTitle, statusMessage, fn) {
   state.aiBusy = true;
   state.aiErrorMsg = '';
   state.aiStatusMsg = statusMessage;
+  state.streamingRun = { action: actionTitle, text: '', sourceLabel: null, modeUsed: '' };
   renderAIPane();
   if (window.innerWidth <= 880) switchMobileTab('ai');
 
+  const handleStreamChunk = ({ text, sourceLabel, modeUsed }) => {
+    state.streamingRun = {
+      action: actionTitle,
+      text,
+      sourceLabel,
+      modeUsed
+    };
+    renderLiveStreamSlot();
+  };
+
   try {
-    await fn();
+    await fn(handleStreamChunk);
     state.aiRuns = await getRecentAIRuns(25);
   } catch (err) {
     state.aiErrorMsg = err.message || 'AI request failed.';
   } finally {
+    state.streamingRun = null;
     state.aiBusy = false;
     state.aiStatusMsg = '';
     renderTopStatus();
@@ -1021,6 +1125,42 @@ function bindEvents() {
   });
 
   document.querySelector('#btn-new-note').addEventListener('click', createAndFocusBlankNote);
+  document.querySelector('#btn-scan-image').addEventListener('click', triggerImageScanPicker);
+  document.querySelector('#btn-ai-scan-image').addEventListener('click', triggerImageScanPicker);
+
+  // Multimodal Image Scan Handler
+  document.querySelector('#input-scan-image').addEventListener('change', async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    await runAIAction('Image Scan', 'Scanning image into structured Markdown...', async (onChunk) => {
+      const prepared = await compressImageFileToBase64(file);
+      const active = getActiveNote();
+      const run = await extractNoteFromImage(prepared, active?.id || null, state.privacyMode, onChunk);
+
+      if (active) {
+        const prefix = active.content.trim() ? `${active.content.trim()}\n\n---\n` : '';
+        const updated = await saveNote({
+          ...active,
+          content: `${prefix}### Scanned Capture (${prepared.fileName})\n${run.output}`,
+          tags: [...active.tags, 'image-scan'],
+          isStarter: false
+        });
+        await refreshNotes(updated.id);
+      } else {
+        const cleanBaseName = prepared.fileName.replace(/\.[^.]+$/, '').slice(0, 40) || 'Field Scan';
+        const created = await saveNote({
+          title: `Scanned Note: ${cleanBaseName}`,
+          content: run.output,
+          tags: ['image-scan', run.sourceLabel === 'On device' ? 'on-device' : 'cloud'],
+          isStarter: false
+        });
+        await refreshNotes(created.id);
+      }
+      populateEditorFromActiveNote();
+      showToast(`Image extracted (${run.sourceLabel}) & saved to note`);
+    });
+  });
 
   document.querySelector('#input-search').addEventListener('input', (e) => {
     state.searchQuery = e.target.value;
@@ -1110,7 +1250,9 @@ function bindEvents() {
       renderAIPane();
       return;
     }
-    runAIAction('Summarizing note...', () => summarizeNote(note, state.privacyMode));
+    runAIAction('Summarize', 'Streaming summary...', (onChunk) =>
+      summarizeNote(note, state.privacyMode, onChunk)
+    );
   });
 
   document.querySelector('#btn-ai-autotag').addEventListener('click', () => {
@@ -1120,8 +1262,8 @@ function bindEvents() {
       renderAIPane();
       return;
     }
-    runAIAction('Extracting tags...', async () => {
-      const res = await generateTagsForNote(note, state.privacyMode);
+    runAIAction('Auto-Tag', 'Extracting tags...', async (onChunk) => {
+      const res = await generateTagsForNote(note, state.privacyMode, onChunk);
       if (res.parsedTags.length > 0) {
         const updated = await saveNote({
           ...note,
@@ -1141,7 +1283,9 @@ function bindEvents() {
       return;
     }
     const style = document.querySelector('#select-rewrite-style').value;
-    runAIAction(`Rewriting (${style})...`, () => rewriteNote(note, style, state.privacyMode));
+    runAIAction(`Rewrite (${style})`, `Streaming ${style} rewrite...`, (onChunk) =>
+      rewriteNote(note, style, state.privacyMode, onChunk)
+    );
   });
 
   document.querySelector('#form-note-qa').addEventListener('submit', (e) => {
@@ -1151,7 +1295,9 @@ function bindEvents() {
     const question = inputEl.value.trim();
     if (!note?.content.trim() || !question) return;
     inputEl.value = '';
-    runAIAction('Answering question...', () => askNoteQuestion(note, question, state.privacyMode));
+    runAIAction('Note Q&A', 'Streaming answer...', (onChunk) =>
+      askNoteQuestion(note, question, state.privacyMode, onChunk)
+    );
   });
 
   document.querySelector('#btn-select-all-synth').addEventListener('click', () => {
@@ -1175,8 +1321,10 @@ function bindEvents() {
     const goalEl = document.querySelector('#input-synth-goal');
     const goal = goalEl.value.trim();
     goalEl.value = '';
-    runAIAction(`Synthesizing ${selectedNotes.length} notes...`, () =>
-      synthesizeMultipleNotes(selectedNotes, goal, state.privacyMode)
+    runAIAction(
+      `Synthesize (${selectedNotes.length} Notes)`,
+      `Synthesizing ${selectedNotes.length} notes...`,
+      (onChunk) => synthesizeMultipleNotes(selectedNotes, goal, state.privacyMode, onChunk)
     );
   });
 
@@ -1204,7 +1352,6 @@ async function init() {
   state.privacyMode = await getSetting('privacyMode', USER_PRIVACY_MODES.HYBRID_DEFAULT);
   setCloudSyncAllowed(state.privacyMode !== USER_PRIVACY_MODES.STRICT_LOCAL);
 
-  // Instant Frame-1 Boot (<10ms)
   const cachedUser = readAuthSnapshot();
   if (cachedUser?.uid) {
     state.user = cachedUser;

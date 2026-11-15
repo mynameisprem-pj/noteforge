@@ -42,12 +42,14 @@ NoteForge is an offline-first notes and field research workspace engineered for 
 | **Auto-Tag Note** | On-device Gemini Nano first -> Cloud fallback | Local Gemini Nano only (Cloud refused) | `⚡ On device` / `☁️ Cloud` |
 | **Rewrite (Clarity / Executive / Academic)** | On-device Gemini Nano first -> Cloud fallback | Local Gemini Nano only (Cloud refused) | `⚡ On device` / `☁️ Cloud` |
 | **Single-Note Q&A** | On-device Gemini Nano first -> Cloud fallback | Local Gemini Nano only (Cloud refused) | `⚡ On device` / `☁️ Cloud` |
+| **Multimodal Image Scan (`📷 Scan Image`)** | Multimodal Gemini Nano first -> Cloud fallback | Local Multimodal Nano only (Cloud refused) | `⚡ On device` / `☁️ Cloud` |
 | **Multi-Note Research Synthesis (2+ Notes)** | Cloud Gemini reasoning (`[Note N]` citations) | Blocked locally unless local model handles request | `☁️ Cloud` / `⚡ On device` |
 
 ---
 
 ## Key Technical Highlights
 
+* **Real-Time Token Streaming (`generateContentStream`) & Multimodal Vision:** Streams AI summaries, rewrites, syntheses, and whiteboard/handwritten photo transcriptions live word-by-word with client-side canvas image compression.
 * **Transparent Execution Provenance:** Reads `result.response.inferenceSource` from `firebase/ai` on every response, displaying a persistent **`⚡ On device`** or **`☁️ Cloud`** badge alongside execution latency (`ms`) and active policy mode.
 * **True Offline-First Storage & PWA Shell:**
 * Notes, tags, and AI provenance history write to **IndexedDB** (`idb`) first in `<5ms`.
@@ -116,4 +118,4 @@ npm run preview
 
 ## License
 
-MIT License
+Apache License 2.0 (see [LICENSE](./LICENSE))

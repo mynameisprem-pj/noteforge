@@ -1,271 +1,301 @@
-import {
-  createHybridModel,
-  HYBRID_MODES,
-  CLOUD_MODELS
-} from './firebase.js';
+import { createHybridModel, HYBRID_MODES, CLOUD_MODELS } from './firebase.js';
 import { saveAIRun } from './db.js';
-
-export const ON_DEVICE_CHAR_LIMIT = 4500;
-const AI_TIMEOUT_MS = 35000;
 
 export const USER_PRIVACY_MODES = {
   HYBRID_DEFAULT: 'PREFER_ON_DEVICE',
   STRICT_LOCAL: 'ONLY_ON_DEVICE'
 };
 
-export function formatInferenceSource(rawSource, effectiveMode) {
-  const normalized = String(rawSource || '').toUpperCase();
-  if (
-    normalized.includes('ON_DEVICE') ||
-    effectiveMode === HYBRID_MODES.ONLY_ON_DEVICE
-  ) {
+export const ON_DEVICE_CHAR_LIMIT = 4500;
+
+const SYSTEM_COMPANION_PROMPT =
+  'You are NoteForge, a concise, accurate research assistant. Use clean Markdown formatting. Never fabricate facts outside the provided notes or image.';
+
+function normalizeInferenceSource(rawSource, requestedMode) {
+  const s = String(rawSource || '').toLowerCase();
+  if (s.includes('on_device') || s.includes('on-device') || s === 'local') {
     return 'On device';
   }
-  return 'Cloud';
+  if (s.includes('in_cloud') || s.includes('cloud')) {
+    return 'Cloud';
+  }
+  return requestedMode === HYBRID_MODES.ONLY_ON_DEVICE ? 'On device' : 'Cloud';
 }
 
-function resolveRoutingPlan({ privacyMode, isComplexTask, totalChars }) {
-  // 1. Strict Privacy Lock: NEVER send data to cloud
+function selectInferencePlan({ privacyMode, totalChars, isMultiNote = false }) {
   if (privacyMode === USER_PRIVACY_MODES.STRICT_LOCAL) {
     return {
       sdkMode: HYBRID_MODES.ONLY_ON_DEVICE,
-      cloudModel: CLOUD_MODELS.FAST_DEFAULT,
-      routingReason: 'Privacy Lock active (ONLY_ON_DEVICE — cloud strictly refused)'
+      modeLabel: 'ONLY_ON_DEVICE (Strict Privacy Lock)',
+      cloudModel: CLOUD_MODELS.FAST_DEFAULT
     };
   }
 
-  const exceedsLocalWindow = totalChars > ON_DEVICE_CHAR_LIMIT;
-
-  // 2. Multi-note synthesis or long documents -> direct Cloud execution (fast & reliable)
-  if (isComplexTask || exceedsLocalWindow) {
-    if (typeof navigator !== 'undefined' && !navigator.onLine) {
-      return {
-        sdkMode: HYBRID_MODES.PREFER_ON_DEVICE,
-        cloudModel: CLOUD_MODELS.FAST_DEFAULT,
-        routingReason: 'Offline detected — attempting local Gemini Nano fallback'
-      };
-    }
+  if (isMultiNote || totalChars > ON_DEVICE_CHAR_LIMIT) {
     return {
-      sdkMode: HYBRID_MODES.ONLY_IN_CLOUD,
-      // Use proven fast cloud model so multi-note synthesis returns in ~2-5s without hanging
-      cloudModel: CLOUD_MODELS.FAST_DEFAULT,
-      routingReason: isComplexTask
-        ? 'Multi-note synthesis routed directly to Cloud'
-        : `Long document (${totalChars.toLocaleString()} chars) routed directly to Cloud`
+      sdkMode: HYBRID_MODES.PREFER_IN_CLOUD,
+      modeLabel: isMultiNote
+        ? 'PREFER_IN_CLOUD (Multi-Note Synthesis)'
+        : 'PREFER_IN_CLOUD (Long Context Fallback)',
+      cloudModel: CLOUD_MODELS.FAST_DEFAULT
     };
   }
 
-  // 3. Default short note actions -> Try Gemini Nano on-device first, fall back to Cloud
   return {
     sdkMode: HYBRID_MODES.PREFER_ON_DEVICE,
-    cloudModel: CLOUD_MODELS.FAST_DEFAULT,
-    routingReason: 'Short note task — trying Gemini Nano on-device first, Cloud fallback ready'
+    modeLabel: 'PREFER_ON_DEVICE (Local-First Hybrid)',
+    cloudModel: CLOUD_MODELS.FAST_DEFAULT
   };
 }
 
-function withTimeout(promise, ms) {
-  let timerId;
-  const timeoutPromise = new Promise((_, reject) => {
-    timerId = setTimeout(() => {
-      reject(new Error(`AI request timed out after ${Math.round(ms / 1000)}s. Check your connection or try again.`));
-    }, ms);
-  });
-  return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timerId));
-}
-
-async function executeHybridRequest({
+/**
+ * Core Hybrid Runner with Live Token Streaming (`generateContentStream`) + Provenance Tracking.
+ * Gracefully falls back to `generateContent` if a local browser runtime doesn't expose streaming.
+ */
+async function executeHybridTask({
   action,
   noteId,
   prompt,
-  systemInstruction,
+  contentParts = null,
+  multimodal = false,
   privacyMode,
-  isComplexTask = false,
-  totalChars = 0
+  totalChars,
+  isMultiNote = false,
+  onStreamChunk = null
 }) {
-  const plan = resolveRoutingPlan({ privacyMode, isComplexTask, totalChars });
+  const plan = selectInferencePlan({ privacyMode, totalChars, isMultiNote });
   const startedAt = performance.now();
 
+  if (!navigator.onLine && plan.sdkMode === HYBRID_MODES.PREFER_IN_CLOUD) {
+    plan.sdkMode = HYBRID_MODES.ONLY_ON_DEVICE;
+    plan.modeLabel = 'ONLY_ON_DEVICE (Offline Emergency Route)';
+  }
+
   try {
-    const model = createHybridModel(plan.sdkMode, plan.cloudModel, systemInstruction);
-    const result = await withTimeout(model.generateContent(prompt), AI_TIMEOUT_MS);
+    const model = createHybridModel(
+      plan.sdkMode,
+      plan.cloudModel,
+      SYSTEM_COMPANION_PROMPT,
+      multimodal
+    );
+
+    const requestPayload = contentParts || prompt;
+    let output = '';
+    let rawSource = null;
+
+    if (typeof onStreamChunk === 'function' && typeof model.generateContentStream === 'function') {
+      try {
+        const streamResult = await model.generateContentStream(requestPayload);
+        for await (const chunk of streamResult.stream) {
+          const piece = typeof chunk.text === 'function' ? chunk.text() : '';
+          if (piece) {
+            output += piece;
+            if (!rawSource && chunk?.inferenceSource) {
+              rawSource = chunk.inferenceSource;
+            }
+            onStreamChunk({
+              text: output,
+              sourceLabel: rawSource ? normalizeInferenceSource(rawSource, plan.sdkMode) : null,
+              modeUsed: plan.modeLabel
+            });
+          }
+        }
+        const finalResponse = await streamResult.response;
+        rawSource = finalResponse?.inferenceSource || rawSource || 'unknown';
+        if (!output && typeof finalResponse?.text === 'function') {
+          output = finalResponse.text()?.trim() || '';
+        }
+      } catch (streamErr) {
+        // If streaming fails before emitting tokens on an experimental local session, retry non-streamed
+        if (output.length > 0) throw streamErr;
+        const fallbackRes = await model.generateContent(requestPayload);
+        output = fallbackRes.response.text()?.trim() || '';
+        rawSource = fallbackRes.response.inferenceSource || 'unknown';
+      }
+    } else {
+      const result = await model.generateContent(requestPayload);
+      output = result.response.text()?.trim() || '';
+      rawSource = result.response.inferenceSource || 'unknown';
+    }
+
+    output = output.trim() || '(No output returned)';
     const latencyMs = Math.round(performance.now() - startedAt);
+    const sourceLabel = normalizeInferenceSource(rawSource, plan.sdkMode);
 
-    const text = result.response.text().trim();
-    const sourceRaw = result.response.inferenceSource || (plan.sdkMode === HYBRID_MODES.ONLY_IN_CLOUD ? 'IN_CLOUD' : 'UNKNOWN');
-    const sourceLabel = formatInferenceSource(sourceRaw, plan.sdkMode);
-
-    const runRecord = await saveAIRun({
+    const savedRecord = await saveAIRun({
       noteId,
       action,
-      promptPreview: prompt.slice(0, 140),
-      output: text,
-      sourceRaw,
+      promptPreview: prompt.slice(0, 180),
+      output,
+      sourceRaw: rawSource,
       sourceLabel,
-      modeUsed: privacyMode,
+      modeUsed: plan.modeLabel,
       latencyMs
     });
 
-    return {
-      ...runRecord,
-      routingReason: plan.routingReason
-    };
+    return savedRecord;
   } catch (err) {
     console.error(`[NoteForge AI Error - ${action}]:`, err);
 
-    if (privacyMode === USER_PRIVACY_MODES.STRICT_LOCAL) {
+    if (plan.sdkMode === HYBRID_MODES.ONLY_ON_DEVICE) {
       throw new Error(
-        'Blocked by ONLY_ON_DEVICE Privacy Mode: On-device Gemini Nano is not available in this browser right now, so NoteForge refused to send your notes to the cloud.'
+        'On-device Gemini Nano is unavailable on this browser/hardware (or lacks multimodal flag support), and Privacy Mode is locked to ONLY_ON_DEVICE. Switch to Hybrid Mode to allow Cloud fallback.'
       );
     }
-    if (typeof navigator !== 'undefined' && !navigator.onLine) {
+
+    if (!navigator.onLine) {
       throw new Error(
-        'You are currently offline and Chrome Gemini Nano is not yet downloaded on this device. Enable Gemini Nano while online to unlock 100% offline AI.'
+        'You are offline and local Gemini Nano is not ready in this browser. Reconnect to the internet or enable Chrome Built-in AI flags.'
       );
     }
-    throw new Error(err?.message || 'Hybrid AI inference failed.');
+
+    throw new Error(err?.message || 'Hybrid AI inference failed. Check your Firebase AI Logic setup.');
   }
 }
 
-// ---------------- FEATURE ACTIONS ----------------
+// ---------------- PUBLIC CAPABILITIES ----------------
 
-export async function summarizeNote(note, privacyMode) {
-  const prompt = [
-    `Summarize the following research note clearly with:`,
-    `1. A 1-sentence core takeaway`,
-    `2. 3–5 concise bullet points of key facts`,
-    `3. Any open action items (if present)`,
-    ``,
-    `Title: ${note.title}`,
-    `Content:\n${note.content}`
-  ].join('\n');
+export async function summarizeNote(note, privacyMode, onStreamChunk) {
+  const prompt = `Summarize the following research note into:
+1. **TL;DR** (1-2 crisp sentences)
+2. **Key Takeaways** (3-5 bullet points)
+3. **Action Items / Open Questions** (if any)
 
-  return executeHybridRequest({
+Note Title: ${note.title}
+Note Content:
+${note.content}`;
+
+  return executeHybridTask({
     action: 'Summarize',
     noteId: note.id,
     prompt,
-    systemInstruction:
-      'You are NoteForge, a concise, accurate research assistant. Keep summaries crisp, factual, and grounded strictly in the provided note.',
     privacyMode,
-    isComplexTask: false,
-    totalChars: note.content.length
+    totalChars: note.content.length,
+    onStreamChunk
   });
 }
 
-export async function generateTagsForNote(note, privacyMode) {
-  const prompt = [
-    `Read this note and return ONLY a comma-separated list of 3 to 5 lowercase kebab-case research tags (no numbering, no explanation, no hashtags).`,
-    `Example output: offline-sync, clinical-workflow, field-study, ux-research`,
-    ``,
-    `Title: ${note.title}`,
-    `Content:\n${note.content}`
-  ].join('\n');
+export async function generateTagsForNote(note, privacyMode, onStreamChunk) {
+  const prompt = `Read this research note and return ONLY a comma-separated list of 3 to 5 short lowercase kebab-case topic tags (example: offline-sync, clinical-workflow, hybrid-ai). Do not include explanations or numbering.
 
-  const res = await executeHybridRequest({
+Note Title: ${note.title}
+Note Content:
+${note.content}`;
+
+  const run = await executeHybridTask({
     action: 'Auto-Tag',
     noteId: note.id,
     prompt,
-    systemInstruction:
-      'Return only 3 to 5 comma-separated lowercase kebab-case tags with no extra commentary.',
     privacyMode,
-    isComplexTask: false,
-    totalChars: note.content.length
+    totalChars: note.content.length,
+    onStreamChunk
   });
 
-  const parsedTags = res.output
+  const parsedTags = run.output
     .replace(/[#*`\n]/g, ',')
     .split(',')
-    .map((t) =>
-      t
-        .trim()
-        .toLowerCase()
-        .replace(/[^a-z0-9-\s]/g, '')
-        .replace(/\s+/g, '-')
-    )
+    .map((t) => t.trim().toLowerCase().replace(/[^a-z0-9-\s]/g, '').replace(/\s+/g, '-'))
     .filter((t) => t.length >= 2 && t.length <= 28)
     .slice(0, 5);
 
-  return {
-    ...res,
-    parsedTags
-  };
+  return { run, parsedTags };
 }
 
-export async function rewriteNote(note, stylePreset, privacyMode) {
-  const styleGuides = {
-    clarity: 'Tighten prose for maximum clarity, active voice, and readability while preserving every fact.',
-    executive: 'Rewrite as a crisp executive research brief with clear subheadings and scannable bullets.',
-    academic: 'Rewrite in clear, rigorous academic research prose suitable for a paper or technical report.'
+export async function rewriteNote(note, style = 'clarity', privacyMode, onStreamChunk) {
+  const styleInstructions = {
+    clarity: 'Rewrite the note for maximum clarity, conciseness, and clean Markdown structure while preserving every factual detail.',
+    executive: 'Transform the note into a crisp Executive Research Brief with bold headings and high-signal bullet points.',
+    academic: 'Rewrite the note in formal academic prose suitable for a research methodology or literature review section.'
   };
 
-  const instruction = styleGuides[stylePreset] || styleGuides.clarity;
-  const prompt = [
-    `Task: ${instruction}`,
-    `Do not invent facts not present in the source text.`,
-    ``,
-    `Title: ${note.title}`,
-    `Original Note:\n${note.content}`
-  ].join('\n');
+  const instruction = styleInstructions[style] || styleInstructions.clarity;
+  const prompt = `${instruction}
 
-  return executeHybridRequest({
-    action: `Rewrite (${stylePreset})`,
+Original Title: ${note.title}
+Original Content:
+${note.content}`;
+
+  return executeHybridTask({
+    action: `Rewrite (${style})`,
     noteId: note.id,
     prompt,
-    systemInstruction: 'You are an expert research editor. Output clean Markdown.',
     privacyMode,
-    isComplexTask: false,
-    totalChars: note.content.length
+    totalChars: note.content.length,
+    onStreamChunk
   });
 }
 
-export async function askNoteQuestion(note, question, privacyMode) {
-  const prompt = [
-    `Answer the user's question using ONLY the note below. If the note does not contain enough information, state what is missing clearly.`,
-    ``,
-    `Note Title: ${note.title}`,
-    `Note Content:\n${note.content}`,
-    ``,
-    `Question: ${question}`
-  ].join('\n');
+export async function askNoteQuestion(note, question, privacyMode, onStreamChunk) {
+  const prompt = `Answer the researcher's question strictly using the provided note. If the note does not contain enough information, state what is missing clearly.
 
-  return executeHybridRequest({
+Note Title: ${note.title}
+Note Content:
+${note.content}
+
+Question: ${question}`;
+
+  return executeHybridTask({
     action: 'Note Q&A',
     noteId: note.id,
     prompt,
-    systemInstruction: 'Answer accurately and concisely based on the user note.',
     privacyMode,
-    isComplexTask: false,
-    totalChars: note.content.length + question.length
+    totalChars: note.content.length + question.length,
+    onStreamChunk
   });
 }
 
-export async function synthesizeMultipleNotes(notes, researchGoal, privacyMode) {
-  const combinedChars = notes.reduce((acc, n) => acc + n.content.length + n.title.length, 0);
+export async function extractNoteFromImage({ base64Data, mimeType, fileName = 'image' }, noteId, privacyMode, onStreamChunk) {
+  const prompt = `Examine this captured research image (${fileName} — e.g., handwritten field notes, whiteboard diagram, slide, or document table) and extract it into clean, structured Markdown:
+1. **Extracted Content**: Accurate transcription of text, bullet lists, or Markdown tables.
+2. **Visual / Diagram Observations**: Brief summary of any charts, arrows, or layout relationships (omit if plain text).`;
 
-  const formattedNotes = notes
+  const contentParts = [
+    prompt,
+    {
+      inlineData: {
+        data: base64Data,
+        mimeType
+      }
+    }
+  ];
+
+  return executeHybridTask({
+    action: 'Image Scan',
+    noteId: noteId || 'image-scan',
+    prompt,
+    contentParts,
+    multimodal: true,
+    privacyMode,
+    totalChars: prompt.length,
+    onStreamChunk
+  });
+}
+
+export async function synthesizeMultipleNotes(notes, focusGoal = '', privacyMode, onStreamChunk) {
+  const combinedNotes = notes
     .map(
       (n, idx) =>
-        `--- SOURCE NOTE [${idx + 1}]: "${n.title}" (tags: ${n.tags.join(', ') || 'none'}) ---\n${n.content}`
+        `--- [Note ${idx + 1}: "${n.title}"] ---\nTags: ${n.tags.join(', ') || 'none'}\n${n.content}`
     )
     .join('\n\n');
 
-  const prompt = [
-    `Synthesize insights across these ${notes.length} research notes.`,
-    researchGoal?.trim()
-      ? `Specific Research Focus / Prompt: ${researchGoal.trim()}`
-      : `Identify shared themes, tensions or trade-offs across sources, and concrete next recommendations.`,
-    `Cite sources inline as [Note 1], [Note 2], etc., so every claim is traceable.`,
-    ``,
-    formattedNotes
-  ].join('\n');
+  const prompt = `Synthesize the following ${notes.length} research notes into a unified **Cross-Note Research Synthesis**.
+${focusGoal ? `Specific Research Focus: ${focusGoal}\n` : ''}
+Include:
+1. **Core Cross-Cutting Themes** (cite sources explicitly as [Note 1], [Note 2], etc.)
+2. **Tensions, Trade-offs, or Gaps** across the notes
+3. **Recommended Next Research / Engineering Steps**
 
-  return executeHybridRequest({
-    action: `Multi-Note Synthesis (${notes.length} notes)`,
+Corpus:
+${combinedNotes}`;
+
+  return executeHybridTask({
+    action: `Synthesize (${notes.length} Notes)`,
     noteId: 'multi-note',
     prompt,
-    systemInstruction:
-      'You are a senior research synthesis engine. Cross-reference sources, highlight connections and contradictions, and cite [Note N] inline.',
     privacyMode,
-    isComplexTask: true,
-    totalChars: combinedChars
+    totalChars: combinedNotes.length,
+    isMultiNote: true,
+    onStreamChunk
   });
 }

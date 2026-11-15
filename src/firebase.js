@@ -125,10 +125,19 @@ export const CLOUD_MODELS = {
   DEEP_SYNTHESIS: 'gemini-3.8-flash'
 };
 
+const MULTIMODAL_PROMPT_API_OPTIONS = {
+  expectedInputs: [
+    { type: "text", languages: ["en"] },
+    { type: "image" }
+  ],
+  expectedOutputs: [{ type: "text", languages: ["en"] }]
+};
+
 export function createHybridModel(
   mode = InferenceMode.PREFER_ON_DEVICE,
   cloudModelName = CLOUD_MODELS.FAST_DEFAULT,
-  systemInstruction = ''
+  systemInstruction = "",
+  multimodal = false
 ) {
   const config = {
     mode,
@@ -139,11 +148,12 @@ export function createHybridModel(
   };
 
   if (mode !== InferenceMode.ONLY_IN_CLOUD) {
+    const baseOpts = multimodal ? MULTIMODAL_PROMPT_API_OPTIONS : PROMPT_API_OPTIONS;
     config.onDeviceParams = {
       createOptions: {
-        ...PROMPT_API_OPTIONS,
+        ...baseOpts,
         ...(systemInstruction
-          ? { initialPrompts: [{ role: 'system', content: systemInstruction }] }
+          ? { initialPrompts: [{ role: "system", content: systemInstruction }] }
           : {})
       }
     };
