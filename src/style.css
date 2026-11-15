@@ -1002,3 +1002,97 @@ button {
     text-overflow: ellipsis;
   }
 }
+
+/* ---------- ULTRA-CLEAN NARROW MOBILE HEADER & SWIPEABLE BARS ---------- */
+.editor-toolbar,
+.tags-editor-row {
+  overflow-x: auto;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+}
+
+.editor-toolbar::-webkit-scrollbar,
+.tags-editor-row::-webkit-scrollbar {
+  display: none;
+}
+
+@media (max-width: 540px) {
+  .topbar {
+    height: 3.25rem;
+    padding: 0 0.6rem;
+    gap: 0.35rem;
+  }
+
+  .brand {
+    gap: 0.42rem;
+  }
+
+  .brand-logo {
+    width: 1.7rem;
+    height: 1.7rem;
+  }
+
+  .brand-title {
+    font-size: 0.9rem;
+  }
+
+  .topbar-right {
+    gap: 0.35rem;
+  }
+
+  /* Collapse 2-button switch into a single 1-tap active pill on phones */
+  .mode-switch {
+    padding: 0.12rem;
+  }
+
+  .mode-switch .mode-btn:not(.active-hybrid):not(.active-private) {
+    display: none;
+  }
+
+  .mode-switch .mode-btn {
+    padding: 0.25rem 0.58rem;
+    font-size: 0.7rem;
+  }
+
+  /* Status button becomes a clean circular dot button */
+  #btn-telemetry.icon-pill-btn {
+    width: 1.9rem;
+    height: 1.9rem;
+    padding: 0;
+    justify-content: center;
+  }
+
+  /* Compact Sign-in / Avatar trigger */
+  .account-pill-btn.guest-mode {
+    height: 1.9rem;
+    padding: 0 0.52rem;
+    font-size: 0.7rem;
+  }
+
+  .account-pill-btn:not(.guest-mode) {
+    width: 1.9rem;
+    height: 1.9rem;
+    padding: 0;
+    justify-content: center;
+  }
+
+  /* Keep popovers safely inside phone screen edges */
+  .popover-card {
+    position: fixed;
+    top: 3.55rem;
+    right: 0.6rem;
+    left: 0.6rem;
+    width: auto !important;
+    max-width: calc(100vw - 1.2rem);
+  }
+
+  .tags-editor-row {
+    flex-wrap: nowrap;
+    padding-bottom: 0.15rem;
+  }
+
+  .tag-chip,
+  .tag-input {
+    flex-shrink: 0;
+  }
+}

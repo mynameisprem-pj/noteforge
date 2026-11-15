@@ -784,6 +784,10 @@ function bindEvents() {
   });
 
   document.querySelector('#mode-prefer-local').addEventListener('click', async () => {
+    if (window.innerWidth <= 540 && state.privacyMode === USER_PRIVACY_MODES.HYBRID_DEFAULT) {
+      document.querySelector('#mode-only-local').click();
+      return;
+    }
     state.privacyMode = USER_PRIVACY_MODES.HYBRID_DEFAULT;
     setCloudSyncAllowed(true);
     await setSetting('privacyMode', state.privacyMode);
@@ -797,6 +801,10 @@ function bindEvents() {
   });
 
   document.querySelector('#mode-only-local').addEventListener('click', async () => {
+    if (window.innerWidth <= 540 && state.privacyMode === USER_PRIVACY_MODES.STRICT_LOCAL) {
+      document.querySelector('#mode-prefer-local').click();
+      return;
+    }
     state.privacyMode = USER_PRIVACY_MODES.STRICT_LOCAL;
     setCloudSyncAllowed(false);
     await setSetting('privacyMode', state.privacyMode);
