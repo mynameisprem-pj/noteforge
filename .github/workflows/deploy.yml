@@ -19,12 +19,11 @@ jobs:
           node-version: '20'
           cache: 'npm'
 
-      - name: Safely write and sanitize .env from GitHub Secret
-        env:
-          RAW_ENV_FILE: ${{ secrets.ENV_FILE }}
+      - name: Create .env from GitHub Secret
         run: |
-          printf '%s\n' "$RAW_ENV_FILE" | sed 's/\r$//; s/^[[:space:]]*//; s/[",]$//; s/"//g; s/'\''//g' > .env
-          grep -q "VITE_FIREBASE_API_KEY=AIza" .env || (echo "ERROR: VITE_FIREBASE_API_KEY missing or malformed in ENV_FILE secret!" && exit 1)
+          cat << 'EOF' > .env
+          ${{ secrets.ENV_FILE }}
+          EOF
 
       - name: Install dependencies and build production bundle
         run: |
