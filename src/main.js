@@ -219,8 +219,28 @@ function mountShell() {
       </div>
     </header>
 
-    <!-- Hidden Multimodal Image Input (supports Mobile Camera + File Picker) -->
+    <!-- Hidden Multimodal Image Inputs (Gallery Upload + Direct Mobile Rear Camera) -->
     <input id="input-scan-image" type="file" accept="image/*" style="display:none;" />
+    <input id="input-camera-capture" type="file" accept="image/*" capture="environment" style="display:none;" />
+
+    <!-- Mobile Camera vs. Upload Picker Modal -->
+    <div id="scan-source-modal" class="scan-modal-backdrop" role="dialog" aria-modal="true" aria-label="Scan Image Source">
+      <div class="scan-modal-sheet">
+        <div class="scan-modal-title">Scan to Research Note</div>
+        <div class="scan-modal-sub">Capture handwritten notes, whiteboards, or tables</div>
+        <button id="btn-pick-camera" type="button" class="btn btn-primary scan-option-btn">
+          ${ICONS.camera}
+          <span>Take Photo with Camera</span>
+        </button>
+        <button id="btn-pick-upload" type="button" class="btn scan-option-btn">
+          ${ICONS.saveNote}
+          <span>Choose Image from Device</span>
+        </button>
+        <button id="btn-cancel-scan" type="button" class="btn" style="width:100%; font-size:0.75rem; color:var(--text-muted); margin-top:0.15rem;">
+          Cancel
+        </button>
+      </div>
+    </div>
 
     <main class="workspace">
       <!-- PANE 1: NOTES -->
@@ -397,11 +417,28 @@ async function createAndFocusBlankNote() {
   titleEl.select();
 }
 
+function isMobileOrTouchDevice() {
+  return (
+    window.matchMedia('(pointer: coarse)').matches ||
+    /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) ||
+    window.innerWidth <= 880
+  );
+}
+
 function triggerImageScanPicker() {
-  const input = document.querySelector('#input-scan-image');
-  if (input && !state.aiBusy) {
-    input.value = '';
-    input.click();
+  if (state.aiBusy) return;
+
+  // On mobile/tablets (or responsive mobile view), offer both Live Camera & Image Upload!
+  if (isMobileOrTouchDevice()) {
+    document.querySelector('#scan-source-modal')?.classList.add('open');
+    return;
+  }
+
+  // On desktop without a rear camera, jump straight into file upload with zero extra clicks
+  const uploadInput = document.querySelector('#input-scan-image');
+  if (uploadInput) {
+    uploadInput.value = '';
+    uploadInput.click();
   }
 }
 
@@ -1128,8 +1165,35 @@ function bindEvents() {
   document.querySelector('#btn-scan-image').addEventListener('click', triggerImageScanPicker);
   document.querySelector('#btn-ai-scan-image').addEventListener('click', triggerImageScanPicker);
 
-  // Multimodal Image Scan Handler
-  document.querySelector('#input-scan-image').addEventListener('change', async (e) => {
+ // Multimodal Image Scan Modal Controls
+  const scanModal = document.querySelector('#scan-source-modal');
+  const closeScanModal = () => scanModal?.classList.remove('open');
+
+  document.querySelector('#btn-cancel-scan')?.addEventListener('click', closeScanModal);
+  scanModal?.addEventListener('click', (e) => {
+    if (e.target === scanModal) closeScanModal();
+  });
+
+  document.querySelector('#btn-pick-camera')?.addEventListener('click', () => {
+    closeScanModal();
+    const camInput = document.querySelector('#input-camera-capture');
+    if (camInput) {
+      camInput.value = '';
+      camInput.click();
+    }
+  });
+
+  document.querySelector('#btn-pick-upload')?.addEventListener('click', () => {
+    closeScanModal();
+    const fileInput = document.querySelector('#input-scan-image');
+    if (fileInput) {
+      fileInput.value = '';
+      fileInput.click();
+    }
+  });
+
+  // Shared Multimodal Image Scan Handler (Camera Photo + Gallery Upload)
+  const handleSelectedScanFile = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
@@ -1160,7 +1224,10 @@ function bindEvents() {
       populateEditorFromActiveNote();
       showToast(`Image extracted (${run.sourceLabel}) & saved to note`);
     });
-  });
+  };
+
+  document.querySelector('#input-scan-image').addEventListener('change', handleSelectedScanFile);
+  document.querySelector('#input-camera-capture').addEventListener('change', handleSelectedScanFile);
 
   document.querySelector('#input-search').addEventListener('input', (e) => {
     state.searchQuery = e.target.value;
